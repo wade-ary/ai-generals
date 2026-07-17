@@ -1,0 +1,21 @@
+# Virtual env
+.venv/
+
+# BC training data & artifacts
+bc/data/
+bc/bc/checkpoints/
+bc/replays/
+
+# Model weights / serialized data
+*.pt
+*.pth
+*.npz
+*.pkl
+*.ckpt
+*.h5
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
