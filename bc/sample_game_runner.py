@@ -1,249 +1,203 @@
 """
-Pipeline: custom maps → scan one full game → vmap across a batch.
+Pick a random HuggingFace generals replay, step it in the env, open pygame GUI.
 
-Architecture
-------------
-1. ``scan_one_game`` — ``jax.lax.scan`` over timesteps for a *single* game
-2. ``run_batch``      — ``jax.vmap(scan_one_game)`` over N games, then ``jit``
+Same flow as ``bc/data_test.ipynb`` (silent env replay → scrubable ReplayGUI).
 
-Fill in ``MAP_INPUT`` / ``MOVES_INPUT`` later. Empty inputs use defaults so this
-runs today (same default map × N, pass-actions for every turn).
+    python -m bc.sample_game_runner
+    python -m bc.sample_game_runner --seed 0
+    python -m bc.sample_game_runner --index 42
+    python -m bc.sample_game_runner --fps 12
 
-    python -m examples.custom_game_pipeline
-    python -m examples.custom_game_pipeline --batch-size 64
-    python -m examples.custom_game_pipeline --replay   # scrub game 0
+Controls: SPACE play/pause | ←/→ step | R restart | Q quit
 """
 from __future__ import annotations
 
 import argparse
+import random
 from typing import Any
 
-import jax
 import jax.numpy as jnp
-import jax.random as jrandom
+import numpy as np
+from datasets import load_dataset
 
-from generals import create_action, create_initial_state, step
+from generals import create_action, create_initial_state, step, get_observation
+from generals.core.action import compute_valid_move_mask
 from generals.core.game import GameInfo, GameState, get_info
+from generals.gui import ReplayGUI
+from generals.gui.properties import GuiMode
 
-# =============================================================================
-# Inputs — leave empty for now; plug specs in later
-# =============================================================================
-# Map: None / {} → default board. Later e.g. {"size": (10, 10), "generals": [...], ...}
-MAP_INPUT: dict[str, Any] | None = None
-
-# Moves: None / {} → all pass. Later: list of length T with (2, 5) actions,
-# or array shaped (T, 2, 5) / (N, T, 2, 5).
-MOVES_INPUT: list | dict[str, Any] | jnp.ndarray | None = None
-
-BATCH_SIZE = 64
-TRUNCATION = 200
-SEED = 0
+PAD_TO = 23
+SEED: int | None = None  # None = fresh random each run
 FPS = 8
 
-
-# Grid encoding (same as create_initial_state):
-#   -2 mountain | 0 empty | 1 P0 general | 2 P1 general | >2 city army value
-def build_map(spec: dict[str, Any] | None) -> jnp.ndarray:
-    """Build a numeric grid from an optional map spec."""
-    if not spec:
-        h, w = 8, 8
-        grid = jnp.zeros((h, w), dtype=jnp.int32)
-        grid = grid.at[1, 1].set(1)  # P0 general
-        grid = grid.at[6, 6].set(2)  # P1 general
-        grid = grid.at[3, 3].set(40)  # city
-        grid = grid.at[2, 5].set(-2)  # mountain
-        grid = grid.at[5, 2].set(-2)
-        return grid
-
-    # --- fill in when you have a real map schema ---
-    raise NotImplementedError("MAP_INPUT schema not implemented yet — pass None for default")
+PASS = np.asarray(create_action(to_pass=True), dtype=np.int32)
+DELTA_TO_DIR = {
+    (-1, 0): 0,  # UP
+    (1, 0): 1,  # DOWN
+    (0, -1): 2,  # LEFT
+    (0, 1): 3,  # RIGHT
+}
 
 
-def build_action_sequence(
-    moves_spec: list | dict[str, Any] | jnp.ndarray | None,
-    truncation: int,
-    batch_size: int,
-) -> jnp.ndarray:
-    """
-    Build actions for the scan.
-
-    Returns:
-        (N, T, 2, 5) int32 — per-game, per-timestep, both players.
-    """
-    pass_pair = jnp.stack([create_action(to_pass=True), create_action(to_pass=True)])
-
-    if not moves_spec:
-        # Empty input → everyone passes every turn (placeholder for BC scripts)
-        return jnp.broadcast_to(pass_pair, (batch_size, truncation, 2, 5))
-
-    if isinstance(moves_spec, list):
-        seq = jnp.stack([jnp.asarray(a, dtype=jnp.int32) for a in moves_spec])  # (T', 2, 5)
-        t = seq.shape[0]
-        if t < truncation:
-            pad = jnp.broadcast_to(pass_pair, (truncation - t, 2, 5))
-            seq = jnp.concatenate([seq, pad], axis=0)
-        else:
-            seq = seq[:truncation]
-        return jnp.broadcast_to(seq, (batch_size, truncation, 2, 5))
-
-    arr = jnp.asarray(moves_spec, dtype=jnp.int32)
-    if arr.ndim == 3:  # (T, 2, 5)
-        return jnp.broadcast_to(arr[:truncation], (batch_size, truncation, 2, 5))
-    if arr.ndim == 4:  # (N, T, 2, 5)
-        return arr[:batch_size, :truncation]
-
-    raise NotImplementedError("MOVES_INPUT dict / unsupported shape — pass None, list, or array")
+def tile_to_rc(tile: int, width: int) -> tuple[int, int]:
+    return divmod(int(tile), int(width))
 
 
-# =============================================================================
-# Part 1 — scan: one full game
-# =============================================================================
-def scan_one_game(
-    initial_state: GameState,
-    actions: jnp.ndarray,
-) -> tuple[GameState, GameInfo]:
-    """
-    Run one game for T steps with ``lax.scan``.
-
-    Args:
-        initial_state: Starting ``GameState`` (single env).
-        actions: (T, 2, 5) action sequence.
-
-    Returns:
-        states: GameState pytree with leading time axis (T, ...)
-        infos:  GameInfo  pytree with leading time axis (T, ...)
-    """
-
-    def body(state: GameState, action: jnp.ndarray):
-        new_state, info = step(state, action)
-        return new_state, (new_state, info)
-
-    _final_state, (states, infos) = jax.lax.scan(body, initial_state, actions)
-    return states, infos
+def dataset_move_to_action(start_tile: int, end_tile: int, is_50: int, width: int) -> np.ndarray:
+    sr, sc = tile_to_rc(start_tile, width)
+    er, ec = tile_to_rc(end_tile, width)
+    direction = DELTA_TO_DIR[(er - sr, ec - sc)]
+    return np.array([0, sr, sc, direction, int(is_50)], dtype=np.int32)
 
 
-# =============================================================================
-# Part 2 — vmap: scan across a batch of games
-# =============================================================================
-@jax.jit
-def run_batch(
-    initial_states: GameState,
-    actions: jnp.ndarray,
-) -> tuple[GameState, GameInfo]:
-    """
-    Parallel full-game rollouts.
-
-    Args:
-        initial_states: Batched GameState (N, ...)
-        actions: (N, T, 2, 5)
-
-    Returns:
-        states: (N, T, ...)
-        infos:  (N, T, ...)
-    """
-    return jax.vmap(scan_one_game)(initial_states, actions)
+def replay_to_grid(replay: dict[str, Any], pad_to: int = PAD_TO) -> np.ndarray:
+    h, w = int(replay["mapHeight"]), int(replay["mapWidth"])
+    if h > pad_to or w > pad_to:
+        raise ValueError(f"map {(h, w)} exceeds pad_to={pad_to}")
+    grid = np.zeros((h, w), dtype=np.int32)
+    for tile in replay["mountains"]:
+        r, c = tile_to_rc(tile, w)
+        grid[r, c] = -2
+    for tile, army in zip(replay["cities"], replay["cityArmies"]):
+        r, c = tile_to_rc(tile, w)
+        grid[r, c] = int(army)
+    for player, tile in enumerate(replay["generals"]):
+        r, c = tile_to_rc(tile, w)
+        grid[r, c] = player + 1  # 1 or 2
+    padded = np.full((pad_to, pad_to), -2, dtype=np.int32)
+    padded[:h, :w] = grid
+    return padded
 
 
-def build_batch_states(
-    map_spec: dict[str, Any] | None,
-    batch_size: int,
-) -> tuple[jnp.ndarray, GameState]:
-    """Create N initial states. Empty map spec → same default grid for every env."""
-    grid = build_map(map_spec)
-    # Stack identical grids for now; later: different maps per batch index.
-    grids = jnp.stack([grid for _ in range(batch_size)])
-    initial_states = jax.vmap(create_initial_state)(grids)
-    return grid, initial_states
+def replay_num_turns(replay: dict[str, Any]) -> int:
+    moves = replay["moves"]
+    if not moves:
+        return 1
+    return int(max(int(m[4]) for m in moves) + 1)
 
 
-def _tree_index(tree, idx: int):
-    """Take element ``idx`` from the leading axis of a pytree."""
-    return jax.tree.map(lambda x: x[idx], tree)
+def replay_to_actions(replay: dict[str, Any], truncation: int) -> np.ndarray:
+    """(T, 2, 5) — missing turns stay as pass."""
+    w = int(replay["mapWidth"])
+    seq = np.broadcast_to(np.stack([PASS, PASS]), (truncation, 2, 5)).copy()
+    for move in replay["moves"]:
+        player, start, end, is_50, turn = (int(x) for x in move)
+        if turn >= truncation:
+            continue
+        seq[turn, player] = dataset_move_to_action(start, end, is_50, w)
+    return seq
 
 
-def trajectory_to_lists(
-    initial_state: GameState,
-    states: GameState,
-    infos: GameInfo,
-) -> tuple[list[GameState], list[GameInfo]]:
-    """Convert a single-game (T, ...) trajectory into Python lists for ReplayGUI."""
-    t = int(states.time.shape[0])
-    states_log = [initial_state] + [_tree_index(states, i) for i in range(t)]
-    infos_log = [get_info(initial_state)] + [_tree_index(infos, i) for i in range(t)]
-    return states_log, infos_log
+def pick_replay(dataset, index: int | None, seed: int | None) -> tuple[int, dict[str, Any]]:
+    rng = random.Random(seed)
+    idx = index if index is not None else rng.randrange(len(dataset))
+    return idx, dataset[idx]
 
 
-def run_pipeline(
-    map_spec: dict[str, Any] | None = MAP_INPUT,
-    moves_spec: list | dict[str, Any] | jnp.ndarray | None = MOVES_INPUT,
-    batch_size: int = BATCH_SIZE,
-    truncation: int = TRUNCATION,
-    seed: int = SEED,
-    replay: bool = False,
-    replay_env: int = 0,
-) -> tuple[GameState, GameInfo]:
-    """
-    Build a batch of games, scan each with ``lax.scan``, vmap across the batch.
+def step_replay(
+    sample: dict[str, Any],
+) -> tuple[list[GameState], list[GameInfo], dict[str, int]]:
+    """Silent env rollout — collect trajectory for GUI (no textual board)."""
+    T = replay_num_turns(sample)
+    grid = replay_to_grid(sample)
+    actions = replay_to_actions(sample, truncation=T)
 
-    Returns batched ``(states, infos)`` with shapes (N, T, ...).
-    """
-    del seed  # reserved for when maps/moves become stochastic
+    state = create_initial_state(jnp.asarray(grid))
+    traj_states: list[GameState] = [state]
+    traj_infos: list[GameInfo] = [get_info(state)]
 
-    _, initial_states = build_batch_states(map_spec, batch_size)
-    actions = build_action_sequence(moves_spec, truncation, batch_size)
+    applied = 0
+    illegal = 0
+    info: GameInfo | None = None
+    t = 0
 
-    # Warmup / run: scan per game, vmap over batch
-    states, infos = run_batch(initial_states, actions)
+    for t in range(T):
+        joint = actions[t]
+        for p in range(2):
+            a = np.asarray(joint[p])
+            if int(a[0]) == 1:
+                continue
+            applied += 1
+            o = get_observation(state, int(p))
+            mask = compute_valid_move_mask(o.armies, o.owned_cells, o.mountains)
+            if not bool(mask[int(a[1]), int(a[2]), int(a[3])]):
+                illegal += 1
 
-    winners = infos.winner[:, -1]
-    n_p0 = int(jnp.sum(winners == 0))
-    n_p1 = int(jnp.sum(winners == 1))
-    n_ongoing = int(jnp.sum(winners < 0))
+        state, info = step(state, jnp.asarray(joint))
+        traj_states.append(state)
+        traj_infos.append(info)
+        if bool(info.is_done):
+            break
+
+    assert info is not None
+    stats = {
+        "T": T,
+        "end_turn": int(info.time),
+        "winner": int(info.winner),
+        "applied": applied,
+        "illegal": illegal,
+        "frames": len(traj_states),
+    }
+    return traj_states, traj_infos, stats
+
+
+def open_gui(
+    sample: dict[str, Any],
+    traj_states: list[GameState],
+    traj_infos: list[GameInfo],
+    fps: int = FPS,
+) -> None:
+    agent_ids = [str(sample["usernames"][0]), str(sample["usernames"][1])]
     print(
-        f"Batch {batch_size} × {truncation} steps  |  "
-        f"P0 wins={n_p0}  P1 wins={n_p1}  unfinished={n_ongoing}"
+        f"opening GUI  frames={len(traj_states)}  fps={fps}  "
+        f"{agent_ids[0]} vs {agent_ids[1]}"
     )
-
-    if replay:
-        from generals.gui import ReplayGUI
-        from generals.gui.properties import GuiMode
-
-        init_i = _tree_index(initial_states, replay_env)
-        states_i = _tree_index(states, replay_env)
-        infos_i = _tree_index(infos, replay_env)
-        states_log, infos_log = trajectory_to_lists(init_i, states_i, infos_i)
-
-        gui = ReplayGUI(
-            states_log[0],
-            agent_ids=["P0", "P1"],
-            mode=GuiMode.REPLAY,
-            start_paused=True,
-            fps=FPS,
-        )
-        print(f"Replay env {replay_env}: SPACE play/pause | ←/→ step | R restart | Q quit")
-        gui.play(states_log, infos_log)
-
-    return states, infos
+    print("controls: SPACE play/pause | ←/→ step | R restart | Q quit")
+    gui = ReplayGUI(
+        traj_states[0],
+        agent_ids=agent_ids,
+        mode=GuiMode.REPLAY,
+        start_paused=True,
+        fps=fps,
+    )
+    gui.play(traj_states, traj_infos)
+    print("GUI closed")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Scan-one-game + vmap-batch pipeline")
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--truncation", type=int, default=TRUNCATION)
-    parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--replay", action="store_true", help="Open scrubable replay for one env")
-    parser.add_argument("--replay-env", type=int, default=0, help="Which batch index to replay")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Pick an HF generals replay and open scrubable pygame GUI"
+    )
+    parser.add_argument("--seed", type=int, default=SEED, help="RNG seed for random pick (default: fresh)")
+    parser.add_argument("--index", type=int, default=None, help="Fixed dataset index (overrides --seed)")
+    parser.add_argument("--fps", type=int, default=FPS)
+    parser.add_argument("--no-gui", action="store_true", help="Step only; skip pygame window")
     args = parser.parse_args()
 
-    run_pipeline(
-        map_spec=MAP_INPUT,
-        moves_spec=MOVES_INPUT,
-        batch_size=args.batch_size,
-        truncation=args.truncation,
-        seed=args.seed,
-        replay=args.replay,
-        replay_env=args.replay_env,
+    print("Loading dataset...")
+    train_dataset = load_dataset("strakammm/generals_io_replays")["train"]
+    print(f"Replays: {len(train_dataset)}")
+
+    idx, sample = pick_replay(train_dataset, args.index, args.seed)
+    print(f"picked index={idx}  id={sample['id']}")
+    print(f"players: {sample['usernames'][0]} vs {sample['usernames'][1]}")
+    print(f"map: {sample['mapWidth']}x{sample['mapHeight']}  moves={len(sample['moves'])}")
+
+    traj_states, traj_infos, stats = step_replay(sample)
+    winner = stats["winner"]
+    wlabel = "P0" if winner == 0 else "P1" if winner == 1 else "none/unfinished"
+    print("--- replay summary ---")
+    print(
+        f"ended at turn={stats['end_turn']}  winner={winner} ({wlabel})  "
+        f"non-pass={stats['applied']}  illegal={stats['illegal']}  "
+        f"GUI frames={stats['frames']}"
     )
+
+    if args.no_gui:
+        print("--no-gui set; skipping window")
+        return
+
+    open_gui(sample, traj_states, traj_infos, fps=args.fps)
 
 
 if __name__ == "__main__":
