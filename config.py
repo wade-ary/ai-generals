@@ -101,6 +101,9 @@ class Config:
     eval_every_after: int = 0    # switch to this eval frequency on last curriculum stage (0 = no switch)
     eval_games: int = 128
     eval_ema_only: bool = False  # if True, eval/ref_eval use only EMA weights (skip current)
+    eval_opponent: str = "random"  # "random" or "checkpoint"
+    eval_opponent_path: str = ""
+    eval_opponent_config: str = ""
     ckpt_every: int = 10
 
     # Reference ELO eval during training

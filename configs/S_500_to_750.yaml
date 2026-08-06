@@ -1,0 +1,84 @@
+# Resume S at iteration 500, train for 250 more PPO iterations, and evaluate
+# against a frozen S_500 checkpoint.
+
+run_name: S
+
+# Resume state and global schedule position
+init_checkpoint: S/S_500.eqx
+ema_checkpoint: S/S_ema_500.eqx
+iteration_offset: 500
+
+# Final S environment (do not restart the three-stage curriculum)
+pad_to: 12
+min_grid_size: 11
+max_grid_size: 12
+min_generals_distance: 11
+max_generals_distance: 17
+num_cities_min: 2
+num_cities_max: 4
+castle_val_min: 13
+castle_val_max: 18
+pool_size: 200000
+reset_pool_every: 10
+truncation: 1024
+curriculum:
+
+# Network -- must exactly match S_500
+network: history_transformer
+depth: 4
+embed_dim: 352
+n_head: 8
+ff_factor: 2
+patch_size: 2
+use_bf16: true
+
+# Run 250 additional iterations: global iterations 501-750
+num_envs: 1024
+num_steps: 256
+num_iters: 250
+minibatch_size: 2048
+seed: 44
+
+# PPO
+num_epochs: 1
+gamma: 1.0
+gae_lambda: 0.9
+clip_eps: 0.2
+max_grad_norm: 0.267
+vf_coef: 0.5
+target_kl: 0.02
+adv_top_frac: 0.5
+reward_fn: relative_progress_reward
+
+# Entropy and learning-rate schedules continue from iteration_offset=500
+ent_schedule: power_law
+ent_coef_start: 0.05
+ent_power: 0.2
+ent_coef_min: 0.001
+lr_schedule: power_law
+lr_power_law_numerator: 0.5
+lr_power_law_exponent: 1.1
+lr_power_law_min: 5e-6
+lr_power_law_max: 1e-4
+
+# Fixed S_500 evaluation benchmark
+eval_every: 50
+eval_games: 512
+eval_opponent: checkpoint
+eval_opponent_path: S/S_500.eqx
+eval_opponent_config: S/config.yaml
+
+# Reference ELO remains disabled for this controlled comparison
+ref_eval_every: 0
+ref_eval_dir: ""
+
+# Save the full resumed result at global iteration 750.
+ckpt_every: 250
+save_every: 250
+
+# Value head -- must exactly match S_500
+value_loss: ce
+num_bins: 128
+v_min: -1.0
+v_max: 1.0
+hl_sigma: 0.04

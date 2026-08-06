@@ -18,6 +18,7 @@ from networks import (
 )
 from evals.agent import Agent
 from evals.ref_eval import ref_eval
+from evals.matchup import play_match
 
 
 @partial(jax.jit, static_argnames=["env", "truncation", "n_maps", "grid_size", "augment_fn", "reset_fn", "greedy_fn"])
@@ -127,6 +128,7 @@ class EvalCtx(NamedTuple):
     ref_h2h: object
     ref_eval_env: object
     ref_eval_pool: object
+    eval_opponent_agent: object
 
 
 def periodic_eval(it, cfg, eval_freq, network, ema_params, static,
@@ -137,25 +139,50 @@ def periodic_eval(it, cfg, eval_freq, network, ema_params, static,
     vs-random eval runs (it drives curriculum advancement).
     """
     eval_ran = False
-    if it == 0 or (it + 1) % eval_freq == 0:
+    if it % eval_freq == 0:
         key, eval_key = jrandom.split(key)
         n_maps = cfg.eval_games // 2
-        eval_obs_state = jax.tree.map(
-            lambda x: jnp.tile(x, (n_maps, *([1] * x.ndim))), ev.single_state)
-        ew, el, ed, edone, wb, lb, sp, _ = evaluate(
-            eval_env, network, eval_key, cfg.truncation, n_maps, cfg.pad_to,
-            eval_obs_state, ev.augment_fn, ev.reset_fn, ev.greedy_fn, pool=eval_pool)
-        ew, el, ed, edone = int(ew), int(el), int(ed), int(edone)
-        wb, lb, sp = int(wb), int(lb), int(sp)
-        last_eval_wr = ew / max(edone, 1)
-        eval_ran = True
-        print(f"  EVAL: {ew}W/{el}L/{ed}D ({last_eval_wr * 100:.0f}%) greedy vs random | Maps({n_maps}): {wb}WB/{lb}LB/{sp}S")
-        logger.log_eval(it, ew, el, ed, edone)
-        logger.log(it, {
-            "eval/won_both": wb / max(n_maps, 1),
-            "eval/lost_both": lb / max(n_maps, 1),
-            "eval/split": sp / max(n_maps, 1),
-        })
+        if ev.eval_opponent_agent is not None:
+            current = Agent(network, cfg, ev.bundle, name="current")
+            opponent = ev.eval_opponent_agent
+            # Same key => identical map batch, with player seats reversed.
+            current_p0, opponent_p1, draws_fwd = play_match(
+                current, opponent, eval_env, eval_pool, n_maps, cfg.truncation, eval_key)
+            opponent_p0, current_p1, draws_rev = play_match(
+                opponent, current, eval_env, eval_pool, n_maps, cfg.truncation, eval_key)
+            ew = current_p0 + current_p1
+            el = opponent_p1 + opponent_p0
+            ed = draws_fwd + draws_rev
+            edone = ew + el + ed
+            wb = lb = sp = 0  # paired aggregate categories are unavailable here
+            last_eval_wr = ew / max(edone, 1)
+            eval_ran = True
+            print(
+                f"  EVAL: {ew}W/{el}L/{ed}D ({last_eval_wr * 100:.0f}%) "
+                f"greedy vs {opponent.name} | Maps({n_maps}) | "
+                f"current wins P0/P1={current_p0}/{current_p1}")
+            logger.log_eval(it, ew, el, ed, edone)
+            logger.log(it, {
+                "eval/current_wins_as_p0": current_p0 / max(n_maps, 1),
+                "eval/current_wins_as_p1": current_p1 / max(n_maps, 1),
+            })
+        else:
+            eval_obs_state = jax.tree.map(
+                lambda x: jnp.tile(x, (n_maps, *([1] * x.ndim))), ev.single_state)
+            ew, el, ed, edone, wb, lb, sp, _ = evaluate(
+                eval_env, network, eval_key, cfg.truncation, n_maps, cfg.pad_to,
+                eval_obs_state, ev.augment_fn, ev.reset_fn, ev.greedy_fn, pool=eval_pool)
+            ew, el, ed, edone = int(ew), int(el), int(ed), int(edone)
+            wb, lb, sp = int(wb), int(lb), int(sp)
+            last_eval_wr = ew / max(edone, 1)
+            eval_ran = True
+            print(f"  EVAL: {ew}W/{el}L/{ed}D ({last_eval_wr * 100:.0f}%) greedy vs random | Maps({n_maps}): {wb}WB/{lb}LB/{sp}S")
+            logger.log_eval(it, ew, el, ed, edone)
+            logger.log(it, {
+                "eval/won_both": wb / max(n_maps, 1),
+                "eval/lost_both": lb / max(n_maps, 1),
+                "eval/split": sp / max(n_maps, 1),
+            })
 
     if ev.ref_agents and (it == 0 or (it + 1) % cfg.ref_eval_every == 0):
         ema_network = eqx.combine(ema_params, static)

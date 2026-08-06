@@ -12,6 +12,7 @@ from generals.core.env import GeneralsEnv
 from train.rewards import get_reward_fn
 from train.rollout_selfplay import collect_rollout as collect_rollout_self
 from train.evaluations import periodic_eval, EvalCtx
+from evals.agent import Agent
 from evals.ref_eval import load_refs
 
 
@@ -345,6 +346,22 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
     ref_h2h = None
     ref_eval_env = None
     ref_eval_pool = None
+    eval_opponent_agent = None
+    if cfg.eval_opponent == "checkpoint":
+        if not cfg.eval_opponent_path or not cfg.eval_opponent_config:
+            raise ValueError(
+                "checkpoint evaluation requires eval_opponent_path and "
+                "eval_opponent_config"
+            )
+        eval_opponent_agent = Agent.load(
+            cfg.eval_opponent_path, cfg.eval_opponent_config)
+        eval_opponent_agent.name = os.path.basename(
+            cfg.eval_opponent_path).removesuffix(".eqx")
+        print(f"EVAL OPPONENT: frozen {eval_opponent_agent.name}")
+    elif cfg.eval_opponent != "random":
+        raise ValueError(
+            f"Unknown eval_opponent '{cfg.eval_opponent}'; use random or checkpoint"
+        )
     if cfg.ref_eval_every > 0 and cfg.ref_eval_dir:
         import copy, json as _json
         ref_agents = load_refs(cfg.ref_eval_dir)
@@ -375,6 +392,7 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         augment_fn=augment_fn, reset_fn=reset_fn, greedy_fn=greedy_fn,
         ref_agents=ref_agents, ref_h2h=ref_h2h,
         ref_eval_env=ref_eval_env, ref_eval_pool=ref_eval_pool,
+        eval_opponent_agent=eval_opponent_agent,
     )
 
     mode_str = "self-play"
@@ -385,8 +403,9 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         network = _get_network()
         on_last_stage = curriculum_stages and current_stage_idx >= len(curriculum_stages) - 1
         eval_freq = cfg.eval_every_after if (cfg.eval_every_after and on_last_stage) else cfg.eval_every
+        global_it = iter_offset + it
         eval_ran, last_eval_wr, key = periodic_eval(
-            it, cfg, eval_freq, network, ema_params, static,
+            global_it, cfg, eval_freq, network, ema_params, static,
             eval_env, eval_pool, ev, logger, key, last_eval_wr)
 
         t0 = time.time()
@@ -558,7 +577,7 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         wall = int(time.time() - train_start)
         hh, mm, ss = wall // 3600, wall % 3600 // 60, wall % 60
         print(
-            f"[{hh:02d}:{mm:02d}:{ss:02d}] Iter {it + 1:3d}/{cfg.num_iters} | Loss: {float(m['total_loss']):.4f} | "
+            f"[{hh:02d}:{mm:02d}:{ss:02d}] Iter {global_it + 1:3d}/{iter_offset + cfg.num_iters} | Loss: {float(m['total_loss']):.4f} | "
             f"PG: {float(m['policy_loss']):.4f} | "
             f"VF: {float(m['value_loss']):.4f} | "
             f"Ent: {float(m['entropy']):.3f} | "
@@ -622,7 +641,7 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
                 "train/max_old_lp": m["max_old_lp"],
                 "train/epochs_used": epochs_used,
             })
-        logger.log(it + 1, log_metrics)
+        logger.log(global_it + 1, log_metrics)
 
         # Update EMA params
         current_params = jax.tree.map(lambda x: x[0], params)
@@ -633,15 +652,16 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         # Extract single-device network for checkpointing
         network = _get_network()
 
-        if (it + 1) % cfg.ckpt_every == 0:
-            ema_ckpt_path = os.path.join(ckpt_dir, f"{run_name}_ema_{it + 1}.eqx")
+        completed_it = global_it + 1
+        if completed_it % cfg.ckpt_every == 0:
+            ema_ckpt_path = os.path.join(ckpt_dir, f"{run_name}_ema_{completed_it}.eqx")
             eqx.tree_serialise_leaves(ema_ckpt_path, eqx.combine(ema_params, static))
 
-        if (it + 1) % cfg.save_every == 0:
-            path = os.path.join(ckpt_dir, f"{run_name}_{it + 1}.eqx")
+        if completed_it % cfg.save_every == 0:
+            path = os.path.join(ckpt_dir, f"{run_name}_{completed_it}.eqx")
             eqx.tree_serialise_leaves(path, (network, _get_opt_state()))
             ema_network = eqx.combine(ema_params, static)
-            ema_path = os.path.join(ckpt_dir, f"{run_name}_ema_{it + 1}.eqx")
+            ema_path = os.path.join(ckpt_dir, f"{run_name}_ema_{completed_it}.eqx")
             eqx.tree_serialise_leaves(ema_path, ema_network)
             ema_latest = os.path.join(ckpt_dir, f"{run_name}_ema.eqx")
             eqx.tree_serialise_leaves(ema_latest, ema_network)
@@ -652,4 +672,11 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         del vals, next_vals, rews, terminated, truncated, winners, owned_cities
         del dones, dones_p0, terminated_p0, winners_p0
 
-    return _get_network(), _get_opt_state()
+    # Evaluate once more after the final PPO update (e.g. global iteration 750).
+    final_it = iter_offset + cfg.num_iters
+    network = _get_network()
+    _, _, key = periodic_eval(
+        final_it, cfg, 1, network, ema_params, static,
+        eval_env, eval_pool, ev, logger, key, last_eval_wr)
+
+    return network, _get_opt_state()
