@@ -36,7 +36,14 @@ import numpy as np
 from datasets import load_dataset
 
 from generals.core.action import compute_valid_move_mask, create_action
-from generals.core.game import GameState, create_initial_state, get_observation, step
+from generals.core.game import (
+    GameState,
+    create_initial_state,
+    execute_action,
+    get_info,
+    get_observation,
+    global_update,
+)
 from networks.common import augment_obs, init_obs_state, obs_to_array
 
 
@@ -224,8 +231,59 @@ def _ppo_inputs_and_next_history(states: GameState, obs_states: Any):
 
 
 @jax.jit
+def _transfer_loser_cells_to_winner(state: GameState) -> GameState:
+    """Apply the same terminal ownership transfer as the production env."""
+
+    winner = state.winner
+    loser = 1 - winner
+    ownership = state.ownership.at[winner].set(
+        state.ownership[winner] | state.ownership[loser]
+    )
+    ownership = ownership.at[loser].set(
+        jnp.zeros_like(state.ownership[loser], dtype=jnp.bool_)
+    )
+    ownership_neutral = state.ownership_neutral & ~state.ownership[loser]
+    return state._replace(
+        ownership=ownership,
+        ownership_neutral=ownership_neutral,
+    )
+
+
+@jax.jit
+def _alternating_priority_step(
+    state: GameState, actions: jnp.ndarray
+) -> tuple[GameState, Any]:
+    """Replay one legacy turn, alternating which player's action resolves first.
+
+    The Hugging Face games predate the current chase/defend/army-size priority
+    system. Their two submitted actions share one pre-turn observation, but
+    player 0 resolves first on even zero-based turns and player 1 on odd turns.
+    """
+
+    done_before = state.winner >= 0
+    first_player = state.time % 2
+    second_player = 1 - first_player
+
+    state = execute_action(state, first_player, actions[first_player])
+    state = execute_action(state, second_player, actions[second_player])
+    state = jax.lax.cond(
+        done_before,
+        lambda current: current,
+        lambda current: current._replace(time=current.time + 1),
+        state,
+    )
+    state = jax.lax.cond(
+        state.winner >= 0,
+        _transfer_loser_cells_to_winner,
+        global_update,
+        state,
+    )
+    return state, get_info(state)
+
+
+@jax.jit
 def _step_batch(states: GameState, actions: jnp.ndarray):
-    return jax.vmap(step)(states, actions)
+    return jax.vmap(_alternating_priority_step)(states, actions)
 
 
 def _empty_sample_buffer() -> dict[str, list[np.ndarray]]:
@@ -536,6 +594,7 @@ def collect_dataset(
         "pad_to": PAD_TO,
         "history_size": HISTORY_SIZE,
         "temporal_window": TEMPORAL_WINDOW,
+        "replay_priority": "alternating_player_0_first_on_even_turns",
         "storage_dtypes": {
             "obs": "float16",
             "action_mask": "bool",

@@ -197,6 +197,9 @@ def run_test(output_dir: Path, require_gpu: bool, overwrite: bool) -> None:
     assert manifest["pad_to"] == PAD_TO
     assert manifest["history_size"] == 7
     assert manifest["temporal_window"] == TEMPORAL_WINDOW
+    assert manifest["replay_priority"] == (
+        "alternating_player_0_first_on_even_turns"
+    )
     assert manifest["samples"] == total_rows, (
         f"manifest samples={manifest['samples']} but shards contain {total_rows}"
     )
