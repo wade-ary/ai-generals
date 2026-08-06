@@ -31,6 +31,7 @@ from data.data_collection import (
 
 
 NUM_GAMES = 10
+TEST_POOL_SIZE = 4
 OBS_CHANNELS = 38
 TEMPORAL_WINDOW = 512
 
@@ -164,10 +165,9 @@ def run_test(output_dir: Path, require_gpu: bool, overwrite: bool) -> None:
         output_dir,
         dataset_name=HF_DATASET,
         split=HF_SPLIT,
-        game_batch_size=NUM_GAMES,
+        game_batch_size=TEST_POOL_SIZE,
         turns_per_shard=TURNS_PER_SHARD,
         max_games=NUM_GAMES,
-        diagnose_illegal=True,
     )
 
     shard_paths = sorted(output_dir.glob("bc_batch_*.npz"))
@@ -195,15 +195,16 @@ def run_test(output_dir: Path, require_gpu: bool, overwrite: bool) -> None:
     illegal_events = _load_json(output_dir / "illegal_moves.json")["events"]
 
     assert manifest["games_requested"] == NUM_GAMES
-    assert manifest["game_batch_size"] == NUM_GAMES
+    assert manifest["game_batch_size"] == TEST_POOL_SIZE
+    assert manifest["rolling_pool_size"] == TEST_POOL_SIZE
+    assert manifest["slot_refills"] == NUM_GAMES - TEST_POOL_SIZE, (
+        "every game after the initial pool must enter through immediate refill"
+    )
     assert manifest["turns_per_shard"] == TURNS_PER_SHARD
     assert manifest["pad_to"] == PAD_TO
     assert manifest["history_size"] == 7
     assert manifest["temporal_window"] == TEMPORAL_WINDOW
-    assert manifest["replay_priority"] == (
-        "alternating_player_1_first_on_even_turns"
-    )
-    assert manifest["diagnose_illegal"] is True
+    assert manifest["replay_priority"] == "ppo_current"
     assert manifest["illegal_moves"] == len(illegal_events)
     assert manifest["samples"] == total_rows, (
         f"manifest samples={manifest['samples']} but shards contain {total_rows}"
@@ -218,11 +219,11 @@ def run_test(output_dir: Path, require_gpu: bool, overwrite: bool) -> None:
     )
     assert sampled_ids.issubset(source_ids)
 
-    # Diagnostic mode continues invalid commands as no-ops, so no simulation
-    # game should be cancelled. The event report below reveals isolated versus
-    # cascading failures without storing invalid commands as BC targets.
+    # Invalid commands continue as no-ops, so only structurally malformed
+    # replays may be cancelled. The event report below verifies that no invalid
+    # command was stored as a BC target.
     assert manifest["failed"] == 0, (
-        f"diagnostic mode unexpectedly cancelled {manifest['failed']} games"
+        f"collector cancelled {manifest['failed']} structurally invalid games"
     )
     assert len(winners) == NUM_GAMES, "not all ten games received an outcome"
     for event in illegal_events:

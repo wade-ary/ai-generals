@@ -5,9 +5,10 @@ deliberately independent of a policy network: observations, history features,
 legal-action masks, and temporal features are produced by the same helpers used
 by PPO, while actions come from the replay.
 
-Each outer batch contains 1,024 games.  Samples are flushed every 256 replay
-turns, but games and their observation histories continue across flushes until
-they finish.  Only recorded, non-pass moves become supervised samples.
+A fixed pool contains 1,024 games. Completed slots are immediately replaced by
+the next replay, just like PPO auto-reset. Samples are flushed every 256 global
+rollout steps, while unfinished games and their histories continue across
+flushes. Only recorded, non-pass, legal moves become supervised samples.
 
 Run from the repository root with, for example::
 
@@ -23,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import time
 from dataclasses import dataclass
@@ -39,10 +39,8 @@ from generals.core.action import compute_valid_move_mask, create_action
 from generals.core.game import (
     GameState,
     create_initial_state,
-    execute_action,
-    get_info,
     get_observation,
-    global_update,
+    step,
 )
 from networks.common import augment_obs, init_obs_state, obs_to_array
 
@@ -231,59 +229,10 @@ def _ppo_inputs_and_next_history(states: GameState, obs_states: Any):
 
 
 @jax.jit
-def _transfer_loser_cells_to_winner(state: GameState) -> GameState:
-    """Apply the same terminal ownership transfer as the production env."""
-
-    winner = state.winner
-    loser = 1 - winner
-    ownership = state.ownership.at[winner].set(
-        state.ownership[winner] | state.ownership[loser]
-    )
-    ownership = ownership.at[loser].set(
-        jnp.zeros_like(state.ownership[loser], dtype=jnp.bool_)
-    )
-    ownership_neutral = state.ownership_neutral & ~state.ownership[loser]
-    return state._replace(
-        ownership=ownership,
-        ownership_neutral=ownership_neutral,
-    )
-
-
-@jax.jit
-def _alternating_priority_step(
-    state: GameState, actions: jnp.ndarray
-) -> tuple[GameState, Any]:
-    """Replay one legacy turn, alternating which player's action resolves first.
-
-    The Hugging Face games predate the current chase/defend/army-size priority
-    system. Their two submitted actions share one pre-turn observation, but
-    player 1 resolves first on even zero-based turns and player 0 on odd turns.
-    """
-
-    done_before = state.winner >= 0
-    first_player = 1 - (state.time % 2)
-    second_player = 1 - first_player
-
-    state = execute_action(state, first_player, actions[first_player])
-    state = execute_action(state, second_player, actions[second_player])
-    state = jax.lax.cond(
-        done_before,
-        lambda current: current,
-        lambda current: current._replace(time=current.time + 1),
-        state,
-    )
-    state = jax.lax.cond(
-        state.winner >= 0,
-        _transfer_loser_cells_to_winner,
-        global_update,
-        state,
-    )
-    return state, get_info(state)
-
-
-@jax.jit
 def _step_batch(states: GameState, actions: jnp.ndarray):
-    return jax.vmap(_alternating_priority_step)(states, actions)
+    """Step replay games with the exact same turn resolution used by PPO."""
+
+    return jax.vmap(step)(states, actions)
 
 
 def _empty_sample_buffer() -> dict[str, list[np.ndarray]]:
@@ -307,7 +256,7 @@ def _append_selected_samples(
     actions: np.ndarray,
     selected: np.ndarray,
     game_ids: np.ndarray,
-    turn: int,
+    turns: np.ndarray,
 ) -> None:
     """Transfer only selected mover samples from device to the host buffer."""
 
@@ -333,7 +282,7 @@ def _append_selected_samples(
     )
     buffer["game_id"].append(game_ids[game_indices].astype(str))
     buffer["player"].append(players.astype(np.int16))
-    buffer["turn"].append(np.full(len(game_indices), turn, dtype=np.int16))
+    buffer["turn"].append(turns[game_indices].astype(np.int16))
 
 
 def _write_shard(
@@ -440,7 +389,7 @@ def _illegal_move_event(
         "turn": int(turn),
         "state_time": int(np.asarray(states.time[game_index])),
         "player": int(player),
-        "first_player": int(1 - (turn % 2)),
+        "priority_system": "ppo_current",
         "action": action.tolist(),
         "both_actions": actions[game_index].astype(np.int32).tolist(),
         "source": [int(row), int(col)],
@@ -453,141 +402,208 @@ def _illegal_move_event(
     }
 
 
-def _collect_game_batch(
-    replays: Sequence[Mapping[str, Any]],
+def _set_tree_rows(tree: Any, indices: np.ndarray, rows: Any) -> Any:
+    """Functionally replace selected rows in a JAX pytree."""
+
+    device_indices = jnp.asarray(indices, dtype=jnp.int32)
+    return jax.tree.map(
+        lambda current, replacement: current.at[device_indices].set(replacement),
+        tree,
+        rows,
+    )
+
+
+def _collect_rolling_pool(
+    dataset: Sequence[Mapping[str, Any]],
+    total_games: int,
     output_dir: Path,
-    batch_index: int,
+    pool_size: int,
     turns_per_shard: int,
     winner_lookup: dict[str, int],
     illegal_move_events: list[dict[str, Any]],
-    diagnose_illegal: bool,
 ) -> dict[str, int]:
-    """Simulate one game batch through completion, flushing turn chunks."""
+    """Collect all replays with immediate PPO-style slot replacement.
 
-    grids: list[np.ndarray] = []
-    cleaned_moves: list[CleanMoves] = []
-    game_ids: list[str] = []
-    preprocessing_failed = 0
-    for replay in replays:
-        game_id = str(replay["id"])
-        try:
-            grids.append(initialise_map(replay))
-            cleaned_moves.append(moves_to_env_actions(replay))
-            game_ids.append(game_id)
-        except (KeyError, TypeError, ValueError) as error:
-            preprocessing_failed += 1
-            print(f"  cancel {game_id}: cleaning failed: {error}")
+    JAX array shapes remain fixed at ``pool_size``. When a game completes, only
+    that state's row is replaced and both of its PPO observation-history rows
+    are zeroed. Other slots continue without interruption or recompilation.
+    """
 
-    if not grids:
-        return {
-            "completed": 0,
-            "draws": 0,
-            "failed": preprocessing_failed,
-            "samples": 0,
-            "illegal_moves": 0,
-        }
-
-    ids = np.asarray(game_ids, dtype=str)
-    states = jax.vmap(create_initial_state)(jnp.asarray(np.stack(grids)))
     single_obs_state = init_obs_state(
         PAD_TO,
         PAD_TO,
         history_size=HISTORY_SIZE,
         temporal_window=TEMPORAL_WINDOW,
     )
-    obs_states = _stack_trees([single_obs_state] * (2 * len(grids)))
-
-    max_turn = max(clean.actions.shape[0] for clean in cleaned_moves)
-    active = np.ones(len(grids), dtype=np.bool_)
-    failed = np.zeros(len(grids), dtype=np.bool_)
-    completed = np.zeros(len(grids), dtype=np.bool_)
+    slot_moves: list[CleanMoves | None] = [None] * pool_size
+    slot_ids = np.full(pool_size, "", dtype=object)
+    local_turns = np.zeros(pool_size, dtype=np.int32)
+    active = np.zeros(pool_size, dtype=np.bool_)
+    next_source_index = 0
+    completed = 0
+    failed = 0
+    draws = 0
     samples_written = 0
-    illegal_start = len(illegal_move_events)
+    global_step = 0
+    chunk_index = 0
 
-    for chunk_index, turn_start in enumerate(range(0, max_turn, turns_per_shard)):
-        turn_stop = min(turn_start + turns_per_shard, max_turn)
+    def load_slots(slots: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Fill slots sequentially, skipping structurally malformed replays."""
+
+        nonlocal next_source_index, failed
+        loaded_slots: list[int] = []
+        loaded_grids: list[np.ndarray] = []
+        for slot in slots.tolist():
+            while next_source_index < total_games:
+                replay = dataset[next_source_index]
+                next_source_index += 1
+                game_id = str(replay.get("id", f"source_index_{next_source_index - 1}"))
+                try:
+                    grid = initialise_map(replay)
+                    clean = moves_to_env_actions(replay)
+                except (KeyError, TypeError, ValueError) as error:
+                    failed += 1
+                    print(f"  cancel {game_id}: cleaning failed: {error}")
+                    continue
+                slot_moves[slot] = clean
+                slot_ids[slot] = game_id
+                local_turns[slot] = 0
+                active[slot] = True
+                loaded_slots.append(slot)
+                loaded_grids.append(grid)
+                break
+            else:
+                slot_moves[slot] = None
+                slot_ids[slot] = ""
+                local_turns[slot] = 0
+                active[slot] = False
+        return np.asarray(loaded_slots, dtype=np.int32), np.asarray(loaded_grids)
+
+    initial_slots, initial_grids = load_slots(np.arange(pool_size, dtype=np.int32))
+    if len(initial_slots) == 0:
+        return {
+            "completed": 0,
+            "draws": 0,
+            "failed": failed,
+            "samples": 0,
+            "illegal_moves": 0,
+            "slot_refills": 0,
+        }
+
+    # Initial fill is dense because pool_size <= total_games and malformed
+    # entries are replaced from the remaining source queue.
+    if len(initial_slots) != pool_size:
+        kept_slots = initial_slots.tolist()
+        slot_moves = [slot_moves[slot] for slot in kept_slots]
+        slot_ids = np.asarray([slot_ids[slot] for slot in kept_slots], dtype=object)
+        local_turns = np.zeros(len(kept_slots), dtype=np.int32)
+        active = np.ones(len(kept_slots), dtype=np.bool_)
+        pool_size = len(kept_slots)
+    states = jax.vmap(create_initial_state)(jnp.asarray(initial_grids))
+    obs_states = _stack_trees([single_obs_state] * (2 * pool_size))
+    slot_refills = 0
+
+    while np.any(active):
         buffer = _empty_sample_buffer()
+        chunk_start = global_step
 
-        for turn in range(turn_start, turn_stop):
+        for _ in range(turns_per_shard):
             if not np.any(active):
                 break
 
-            actions = np.broadcast_to(PASS_ACTION, (len(grids), 2, 5)).copy()
-            has_move = np.zeros((len(grids), 2), dtype=np.bool_)
-            for game_index, clean in enumerate(cleaned_moves):
-                if active[game_index] and turn < clean.actions.shape[0]:
-                    actions[game_index] = clean.actions[turn]
-                    has_move[game_index] = clean.has_move[turn]
+            actions = np.broadcast_to(PASS_ACTION, (pool_size, 2, 5)).copy()
+            has_move = np.zeros((pool_size, 2), dtype=np.bool_)
+            for slot in np.flatnonzero(active):
+                clean = slot_moves[slot]
+                assert clean is not None
+                turn = int(local_turns[slot])
+                if turn < clean.actions.shape[0]:
+                    actions[slot] = clean.actions[turn]
+                    has_move[slot] = clean.has_move[turn]
 
             augmented, masks, temporal, next_obs_states = (
                 _ppo_inputs_and_next_history(states, obs_states)
             )
-
             legal_actions = _actions_are_legal(masks, actions, has_move)
             illegal_actions = has_move & active[:, None] & ~legal_actions
-            for game_index, player in zip(*np.nonzero(illegal_actions)):
+            for slot, player in zip(*np.nonzero(illegal_actions)):
                 event = _illegal_move_event(
-                    states, actions, ids[game_index], game_index, player, turn
+                    states,
+                    actions,
+                    str(slot_ids[slot]),
+                    slot,
+                    player,
+                    int(local_turns[slot]),
                 )
                 illegal_move_events.append(event)
                 print(
-                    f"  diagnostic {ids[game_index]} turn={turn} p={player} "
-                    f"reasons={','.join(event['reasons'])} "
+                    f"  diagnostic {slot_ids[slot]} turn={local_turns[slot]} "
+                    f"p={player} reasons={','.join(event['reasons'])} "
                     f"source_army={event['source_army']}"
                 )
 
-            illegal_games = active & np.any(illegal_actions, axis=1)
-            if not diagnose_illegal and np.any(illegal_games):
-                for game_index in np.flatnonzero(illegal_games):
-                    print(
-                        f"  cancel {ids[game_index]}: illegal/divergent move at turn {turn}"
-                    )
-                failed |= illegal_games
-                active &= ~illegal_games
-
-            # Diagnostic no-ops are never BC targets. The environment already
-            # ignores them, allowing us to observe whether later moves recover
-            # or cascade into further failures.
             selected = has_move & legal_actions & active[:, None]
             _append_selected_samples(
-                buffer, augmented, masks, temporal, actions, selected, ids, turn
+                buffer,
+                augmented,
+                masks,
+                temporal,
+                actions,
+                selected,
+                slot_ids,
+                local_turns,
             )
 
-            # Failed and already-finished games receive passes. Their states are
-            # retained only to keep static batch shapes for JIT compilation.
             step_actions = actions.copy()
             step_actions[~active] = PASS_ACTION
             states, info = _step_batch(states, jnp.asarray(step_actions))
             obs_states = next_obs_states
-
+            local_turns[active] += 1
             winners = np.asarray(info.winner)
-            newly_completed = active & (winners >= 0)
-            for game_index in np.flatnonzero(newly_completed):
-                winner_lookup[ids[game_index]] = int(winners[game_index])
-            completed |= newly_completed
-            active &= ~newly_completed
 
-            # Exhausting a replay without an environment winner is a draw. This
-            # is checked after its final listed turn has been stepped.
-            exhausted = np.fromiter(
-                (
-                    active[i] and turn + 1 >= cleaned_moves[i].actions.shape[0]
-                    for i in range(len(cleaned_moves))
-                ),
-                dtype=np.bool_,
-                count=len(cleaned_moves),
-            )
-            for game_index in np.flatnonzero(exhausted):
-                winner_lookup[ids[game_index]] = -1
-            completed |= exhausted
-            active &= ~exhausted
+            finished_slots: list[int] = []
+            for slot in np.flatnonzero(active):
+                clean = slot_moves[slot]
+                assert clean is not None
+                winner = int(winners[slot])
+                exhausted = local_turns[slot] >= clean.actions.shape[0]
+                if winner >= 0 or exhausted:
+                    outcome = winner if winner >= 0 else -1
+                    winner_lookup[str(slot_ids[slot])] = outcome
+                    draws += int(outcome == -1)
+                    completed += 1
+                    active[slot] = False
+                    finished_slots.append(slot)
+
+            # Refill immediately for the next rollout step, exactly as PPO does.
+            if finished_slots:
+                refill_slots, refill_grids = load_slots(
+                    np.asarray(finished_slots, dtype=np.int32)
+                )
+                if len(refill_slots):
+                    replacement_states = jax.vmap(create_initial_state)(
+                        jnp.asarray(refill_grids)
+                    )
+                    states = _set_tree_rows(states, refill_slots, replacement_states)
+                    history_indices = np.concatenate(
+                        (refill_slots, refill_slots + pool_size)
+                    )
+                    zero_histories = _stack_trees(
+                        [single_obs_state] * len(history_indices)
+                    )
+                    obs_states = _set_tree_rows(
+                        obs_states, history_indices, zero_histories
+                    )
+                    slot_refills += len(refill_slots)
+
+            global_step += 1
 
         shard = _write_shard(
             output_dir,
-            batch_index,
+            0,
             chunk_index,
-            turn_start,
-            turn_stop,
+            chunk_start,
+            global_step,
             buffer,
         )
         chunk_samples = sum(len(part) for part in buffer["action"])
@@ -595,21 +611,24 @@ def _collect_game_batch(
         if shard is not None:
             print(
                 f"  shard {shard.name}: samples={chunk_samples:,}, "
-                f"active={int(active.sum()):,}"
+                f"active={int(active.sum()):,}, loaded={next_source_index:,}/"
+                f"{total_games:,}, completed={completed:,}"
             )
-
-    # A non-failed replay with no moves is a draw and never enters the turn loop.
-    if max_turn == 0:
-        for game_index in np.flatnonzero(~failed):
-            winner_lookup[ids[game_index]] = -1
-            completed[game_index] = True
+        # Checkpoint small metadata after every flush so an interrupted Colab
+        # run retains outcomes and diagnostics for all completed shards.
+        _write_json_atomic(output_dir / "game_winners.json", winner_lookup)
+        _write_json_atomic(
+            output_dir / "illegal_moves.json", {"events": illegal_move_events}
+        )
+        chunk_index += 1
 
     return {
-        "completed": int(completed.sum()),
-        "draws": sum(winner_lookup.get(game_id) == -1 for game_id in ids),
-        "failed": int(failed.sum()) + preprocessing_failed,
+        "completed": completed,
+        "draws": draws,
+        "failed": failed,
         "samples": samples_written,
-        "illegal_moves": len(illegal_move_events) - illegal_start,
+        "illegal_moves": len(illegal_move_events),
+        "slot_refills": slot_refills,
     }
 
 
@@ -621,7 +640,6 @@ def collect_dataset(
     game_batch_size: int = GAME_BATCH_SIZE,
     turns_per_shard: int = TURNS_PER_SHARD,
     max_games: int | None = None,
-    diagnose_illegal: bool = False,
 ) -> None:
     """Collect one sequential epoch over the requested Hugging Face split."""
 
@@ -638,10 +656,10 @@ def collect_dataset(
     total_games = len(dataset)
     if max_games is not None:
         total_games = min(total_games, max(0, int(max_games)))
-    total_batches = math.ceil(total_games / game_batch_size) if total_games else 0
+    pool_size = min(game_batch_size, total_games) if total_games else 0
     print(
-        f"Collecting {total_games:,} games once: batch={game_batch_size:,}, "
-        f"flush={turns_per_shard} turns, batches={total_batches:,}"
+        f"Collecting {total_games:,} games once: rolling_pool={pool_size:,}, "
+        f"flush={turns_per_shard} global steps"
     )
 
     winner_lookup: dict[str, int] = {}
@@ -651,48 +669,43 @@ def collect_dataset(
         "failed": 0,
         "samples": 0,
         "illegal_moves": 0,
+        "slot_refills": 0,
     }
     illegal_move_events: list[dict[str, Any]] = []
     started = time.monotonic()
 
-    for batch_index, start in enumerate(range(0, total_games, game_batch_size)):
-        stop = min(start + game_batch_size, total_games)
-        print(f"batch {batch_index + 1}/{total_batches}: games[{start}:{stop}]")
-        replays = [dataset[index] for index in range(start, stop)]
-        stats = _collect_game_batch(
-            replays,
+    if total_games:
+        stats = _collect_rolling_pool(
+            dataset,
+            total_games,
             output_dir,
-            batch_index,
+            pool_size,
             turns_per_shard,
             winner_lookup,
             illegal_move_events,
-            diagnose_illegal,
         )
         for key in totals:
             totals[key] += stats[key]
-
-        # Persist outcomes after every outer batch so completed work survives an
-        # interruption. Failed/cancelled games are intentionally absent.
-        _write_json_atomic(winner_path, winner_lookup)
-        _write_json_atomic(illegal_path, {"events": illegal_move_events})
-        elapsed = time.monotonic() - started
-        print(
-            f"  progress games={stop:,}/{total_games:,}, "
-            f"samples={totals['samples']:,}, failed={totals['failed']:,}, "
-            f"elapsed={elapsed / 60:.1f}m"
-        )
+    _write_json_atomic(winner_path, winner_lookup)
+    _write_json_atomic(illegal_path, {"events": illegal_move_events})
+    elapsed = time.monotonic() - started
+    print(
+        f"  progress games={totals['completed'] + totals['failed']:,}/"
+        f"{total_games:,}, samples={totals['samples']:,}, "
+        f"failed={totals['failed']:,}, elapsed={elapsed / 60:.1f}m"
+    )
 
     manifest = {
         "dataset": dataset_name,
         "split": split,
         "games_requested": total_games,
         "game_batch_size": game_batch_size,
+        "rolling_pool_size": pool_size,
         "turns_per_shard": turns_per_shard,
         "pad_to": PAD_TO,
         "history_size": HISTORY_SIZE,
         "temporal_window": TEMPORAL_WINDOW,
-        "replay_priority": "alternating_player_1_first_on_even_turns",
-        "diagnose_illegal": diagnose_illegal,
+        "replay_priority": "ppo_current",
         "storage_dtypes": {
             "obs": "float16",
             "action_mask": "bool",
@@ -721,7 +734,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-batch-size", type=int, default=GAME_BATCH_SIZE)
     parser.add_argument("--turns-per-shard", type=int, default=TURNS_PER_SHARD)
     parser.add_argument("--max-games", type=int)
-    parser.add_argument("--diagnose-illegal", action="store_true")
     return parser.parse_args()
 
 
@@ -734,7 +746,6 @@ def main() -> None:
         game_batch_size=args.game_batch_size,
         turns_per_shard=args.turns_per_shard,
         max_games=args.max_games,
-        diagnose_illegal=args.diagnose_illegal,
     )
 
 
