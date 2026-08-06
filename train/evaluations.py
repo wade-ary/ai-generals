@@ -1,5 +1,7 @@
 """Evaluation functions: play network vs random or vs opponent."""
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -18,7 +20,7 @@ from evals.agent import Agent
 from evals.ref_eval import ref_eval
 
 
-@jax.jit(static_argnames=["env", "truncation", "n_maps", "grid_size", "augment_fn", "reset_fn", "greedy_fn"])
+@partial(jax.jit, static_argnames=["env", "truncation", "n_maps", "grid_size", "augment_fn", "reset_fn", "greedy_fn"])
 def evaluate(env, network, key, truncation, n_maps, grid_size,
              obs_state, augment_fn, reset_fn, greedy_fn, pool=None):
     """Play n_maps maps as both player positions vs random.

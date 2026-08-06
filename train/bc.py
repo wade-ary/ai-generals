@@ -13,6 +13,7 @@ Run as a sketch:
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 import jax
@@ -155,7 +156,7 @@ def _step_no_reset(state, actions, truncation: int):
     return timestep, new_state
 
 
-@jax.jit(static_argnames=["env", "num_steps", "augment_fn", "truncation"])
+@partial(jax.jit, static_argnames=["env", "num_steps", "augment_fn", "truncation"])
 def collect_bc_rollout(
     states,
     env,

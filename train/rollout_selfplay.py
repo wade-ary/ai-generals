@@ -1,5 +1,7 @@
 """Rollout collection: self-play environment interaction logic."""
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -16,7 +18,7 @@ from networks import (
 # ---- Rollout (self-play) ----
 
 
-@jax.jit(static_argnames=["env", "num_steps", "grid_size", "reward_fn", "augment_fn", "reset_fn"])
+@partial(jax.jit, static_argnames=["env", "num_steps", "grid_size", "reward_fn", "augment_fn", "reset_fn"])
 def collect_rollout(states, env, network, key, num_steps, obs_state_p0, obs_state_p1,
                     grid_size, reward_fn, augment_fn, reset_fn, gamma, pool=None):
     """Collect rollout with self-play: same network plays both sides.
