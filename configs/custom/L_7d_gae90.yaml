@@ -1,0 +1,116 @@
+run_name: L_7d_gae90
+
+# Map settings
+pad_to: 24
+min_grid_size: 17
+max_grid_size: 23
+min_generals_distance: 4
+max_generals_distance: 8
+truncation: 2048
+mountain_density_min: 0.21
+mountain_density_max: 0.21
+castle_val_min: 40
+castle_val_max: 51
+num_cities_min: 9
+num_cities_max: 11
+
+# Pool
+pool_size: 200000
+reset_pool_every: 20
+
+# Curriculum (generals-distance stages; advance when eval win-rate clears the threshold)
+curriculum:
+  - min_generals_distance: 2
+    max_generals_distance: 6
+
+  - win_rate_threshold: 0.6
+    min_generals_distance: 4
+    max_generals_distance: 8
+
+  - win_rate_threshold: 0.6
+    min_generals_distance: 6
+    max_generals_distance: 13
+
+  - win_rate_threshold: 0.6
+    min_generals_distance: 11
+    max_generals_distance: 17
+
+  - win_rate_threshold: 0.6
+    min_generals_distance: 17
+    max_generals_distance: 28
+
+# Network
+network: history_transformer
+depth: 7
+embed_dim: 448
+n_head: 8
+ff_factor: 3
+patch_size: 3
+conv_dim: 256
+use_bf16: true
+
+init_checkpoint: ''
+ema_checkpoint: ''
+ema_decay: 0.999
+
+# Rollout
+num_envs: 512
+num_steps: 512
+num_iters: 100000
+minibatch_size: 1024
+seed: 44
+num_epochs: 1
+
+# PPO
+gamma: 1.0
+gae_lambda: 0.9
+clip_eps: 0.2
+max_grad_norm: 0.267
+vf_coef: 0.5
+target_kl: 0.02
+adv_top_frac: 0.25
+
+# Entropy
+ent_schedule: power_law
+ent_coef_start: 0.05
+ent_power: 0.2
+ent_coef_min: 0.001
+ent_coef_end: 0.001
+ent_coef_decay_iters: 5000
+
+# Learning rate
+lr: 1e-4
+lr_schedule: power_law
+lr_power_law_numerator: 0.5
+lr_power_law_exponent: 1.1
+lr_power_law_min: 5e-06
+lr_power_law_max: 1e-4
+
+# Value loss (HL-Gauss categorical)
+value_loss: ce
+num_bins: 128
+v_min: -1.0
+v_max: 1.0
+hl_sigma: 0.04
+
+# Eval
+eval_every: 50
+eval_games: 512
+ckpt_every: 500
+save_every: 500
+
+# Reference ELO eval
+ref_eval_every: 250
+ref_eval_games: 500
+ref_eval_dir: checkpoints/references/L_new
+ref_eval_min_grid_size: 17
+ref_eval_max_grid_size: 23
+ref_eval_min_generals_distance: 17
+ref_eval_max_generals_distance: 25
+ref_eval_num_cities_min: 9
+ref_eval_num_cities_max: 11
+ref_eval_castle_val_min: 40
+ref_eval_castle_val_max: 51
+ref_eval_truncation: 2048
+
+debug: false

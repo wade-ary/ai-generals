@@ -1,0 +1,131 @@
+run_name: M_ep27_lrp12_gae70_8M_adv25
+pad_to: 18
+min_grid_size: 17
+max_grid_size: 18
+pool_size: 200000
+reset_pool_every: 20
+
+curriculum:
+  - min_generals_distance: 2
+    max_generals_distance: 6
+    reward_fn: composite_reward
+
+  - win_rate_threshold: 0.6
+    min_generals_distance: 4
+    max_generals_distance: 8
+    reward_fn: composite_reward
+
+  - win_rate_threshold: 0.6
+    min_generals_distance: 6
+    max_generals_distance: 10
+    reward_fn: composite_reward
+
+  - win_rate_threshold: 0.6
+    min_generals_distance: 8
+    max_generals_distance: 14
+    reward_fn: composite_reward
+
+  - win_rate_threshold: 0.6
+    min_generals_distance: 11
+    max_generals_distance: 17
+    reward_fn: composite_reward
+
+  - win_rate_threshold: 0.6
+    min_generals_distance: 17
+    max_generals_distance: 25
+    reward_fn: composite_reward
+
+castle_val_min: 40
+castle_val_max: 51
+
+truncation: 1024
+mountain_density: 0.21
+
+network: history_transformer
+reward_fn: win_lose_reward
+initial_reward_fn: win_lose_reward
+opponent: self
+opponent_path: ''
+init_checkpoint: ''
+ema_checkpoint: ''
+ema_decay: 0.999
+
+depth: 5
+embed_dim: 384
+n_head: 8
+ff_factor: 3
+patch_size: 3
+conv_dim: 256
+
+num_envs: 2048
+num_steps: 256
+num_iters: 50000
+minibatch_size: 2048
+seed: 44
+
+num_epochs: 1
+gamma: 1.0
+gae_lambda: 0.7
+clip_eps: 0.2
+max_grad_norm: 0.267
+vf_coef: 0.5
+target_kl: 0.02
+adv_top_frac: 0.25
+
+ent_schedule: power_law
+ent_coef_start: 0.05
+ent_coef_end: 0.001
+ent_coef_decay_iters: 5000
+ent_power: 0.27
+ent_coef_min: 0.001
+
+lr: 0.0001
+warmup_lr: 0.0
+lr_warmup_iters: 0
+final_lr: 0.0
+lr_decay_iters: 0
+
+lr_schedule: power_law
+lr_power_law_numerator: 0.5
+lr_power_law_exponent: 1.2
+lr_power_law_min: 5e-06
+lr_power_law_max: 1e-4
+
+eval_every: 50
+eval_games: 512
+ckpt_every: 500
+
+# Reference ELO eval (0 = disabled)
+ref_eval_every: 0
+ref_eval_games: 500
+ref_eval_dir: checkpoints/references/M
+ref_eval_matrix: ''
+ref_eval_min_grid_size: 17
+ref_eval_max_grid_size: 18
+ref_eval_min_generals_distance: 17
+ref_eval_max_generals_distance: 25
+ref_eval_num_cities_min: 9
+ref_eval_num_cities_max: 11
+ref_eval_castle_val_min: 40
+ref_eval_castle_val_max: 51
+ref_eval_truncation: 1024
+
+ckpt_pool_size: 0
+save_every: 500
+
+# Population training (disabled by default)
+population_enabled: false
+population_extend_every: 1000
+population_max_size: 20
+population_initial_paths:
+best_cp_proportion: 0.75
+
+use_bf16: true
+
+value_loss: ce
+num_bins: 128
+v_min: -1.6
+v_max: 1.6
+hl_sigma: 0.04
+
+debug: false

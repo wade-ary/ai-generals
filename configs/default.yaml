@@ -1,0 +1,81 @@
+# Environment
+pad_to: 15
+min_grid_size: 12
+max_grid_size: 15
+pool_size: 200000
+reset_pool_every: 10
+
+# Curriculum stages (iter-based progression of generals distance)
+curriculum:
+  - iter: 0
+    min_generals_distance: 4
+    max_generals_distance: 9
+    reward_fn: composite_reward
+  - iter: 500
+    min_generals_distance: 9
+    max_generals_distance: 17
+  - iter: 2000
+    min_generals_distance: 17
+    max_generals_distance: 25
+    reward_fn: win_lose_reward
+  - iter: 5000
+    min_generals_distance: 17
+    max_generals_distance: 35
+
+castle_val_min: 40
+castle_val_max: 51
+
+# Network
+network: transformer # unet, simple_cnn, mlp, simple_augmented_cnn, transformer
+opponent: self  # self, random, or fixed
+#opponent_path: "checkpoints/larger_distances_deeper4/larger_distances_deeper4_6000.eqx"  # path to .eqx checkpoint for opponent=fixed
+#init_checkpoint: "checkpoints/multigpu2/multigpu2_1000.eqx"  # path to .eqx checkpoint for opponent=fixed
+
+# Transformer-specific (ignored by other networks)
+depth: 8
+embed_dim: 256
+n_head: 4
+ff_factor: 2
+patch_size: 3
+
+# Rollouts
+num_envs: 1280 #3072
+num_steps: 256
+truncation: 1024
+num_iters: 25000
+minibatch_size: 2048
+seed: 43
+
+# PPO
+num_epochs: 1
+gamma: 0.999
+gae_lambda: 0.9
+clip_eps: 0.2
+vf_coef: 1.0
+ent_coef: 0.013
+target_kl: 0.02
+adv_top_frac: 0.5
+
+# Optimizer
+lr: 5.0e-5
+warmup_lr: 1e-6
+lr_warmup_iters: 2000   # linear warmup to peak LR (0 = no warmup)
+final_lr: 1e-5
+lr_decay_iters: 8000   # cosine decay from peak to final LR (0 = no decay)
+
+# Evaluation
+eval_every: 10
+eval_games: 512
+ckpt_every: 500
+
+ckpt_pool_size: 5
+save_every: 1000
+
+use_bf16: true
+
+# Value loss: "mse" or "ce" (HL-Gauss categorical)
+value_loss: mse
+# num_bins: 51       # CE only: number of bins
+# v_min: -10.0       # CE only: min value
+# v_max: 10.0        # CE only: max value
+# hl_sigma: 0.75     # CE only: Gaussian smoothing width
