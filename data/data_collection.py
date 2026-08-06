@@ -257,11 +257,11 @@ def _alternating_priority_step(
 
     The Hugging Face games predate the current chase/defend/army-size priority
     system. Their two submitted actions share one pre-turn observation, but
-    player 0 resolves first on even zero-based turns and player 1 on odd turns.
+    player 1 resolves first on even zero-based turns and player 0 on odd turns.
     """
 
     done_before = state.winner >= 0
-    first_player = state.time % 2
+    first_player = 1 - (state.time % 2)
     second_player = 1 - first_player
 
     state = execute_action(state, first_player, actions[first_player])
@@ -594,7 +594,7 @@ def collect_dataset(
         "pad_to": PAD_TO,
         "history_size": HISTORY_SIZE,
         "temporal_window": TEMPORAL_WINDOW,
-        "replay_priority": "alternating_player_0_first_on_even_turns",
+        "replay_priority": "alternating_player_1_first_on_even_turns",
         "storage_dtypes": {
             "obs": "float16",
             "action_mask": "bool",
