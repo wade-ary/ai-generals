@@ -264,17 +264,25 @@ def _append_selected_samples(
     if len(game_indices) == 0:
         return
 
+    # Selection count varies every step. Indexing a JAX device array with these
+    # variable-length host indices can trigger a fresh XLA gather compilation
+    # for every distinct count. Transfer fixed-shape rollout outputs once, then
+    # perform the dynamic mover selection with NumPy on the host.
+    augmented_host = np.asarray(augmented)
+    masks_host = np.asarray(masks)
+    temporal_host = np.asarray(temporal)
+
     # Persist floating-point policy inputs in portable float16 to keep shards
     # compact. The augmented values have already passed through PPO's bfloat16
     # cast; training casts the loaded arrays to its compute dtype.
     buffer["obs"].append(
-        np.asarray(augmented[game_indices, players], dtype=np.float16)
+        np.asarray(augmented_host[game_indices, players], dtype=np.float16)
     )
     buffer["action_mask"].append(
-        np.asarray(masks[game_indices, players], dtype=np.bool_)
+        np.asarray(masks_host[game_indices, players], dtype=np.bool_)
     )
     buffer["temporal"].append(
-        np.asarray(temporal[game_indices, players], dtype=np.float16)
+        np.asarray(temporal_host[game_indices, players], dtype=np.float16)
     )
     buffer["action"].append(actions[game_indices, players].astype(np.int16))
     buffer["reward"].append(
@@ -506,6 +514,7 @@ def _collect_rolling_pool(
     while np.any(active):
         buffer = _empty_sample_buffer()
         chunk_start = global_step
+        chunk_illegal_start = len(illegal_move_events)
 
         for _ in range(turns_per_shard):
             if not np.any(active):
@@ -536,11 +545,6 @@ def _collect_rolling_pool(
                     int(local_turns[slot]),
                 )
                 illegal_move_events.append(event)
-                print(
-                    f"  diagnostic {slot_ids[slot]} turn={local_turns[slot]} "
-                    f"p={player} reasons={','.join(event['reasons'])} "
-                    f"source_army={event['source_army']}"
-                )
 
             selected = has_move & legal_actions & active[:, None]
             _append_selected_samples(
@@ -607,10 +611,12 @@ def _collect_rolling_pool(
             buffer,
         )
         chunk_samples = sum(len(part) for part in buffer["action"])
+        chunk_illegal = len(illegal_move_events) - chunk_illegal_start
         samples_written += chunk_samples
         if shard is not None:
             print(
                 f"  shard {shard.name}: samples={chunk_samples:,}, "
+                f"invalid_skipped={chunk_illegal:,}, "
                 f"active={int(active.sum()):,}, loaded={next_source_index:,}/"
                 f"{total_games:,}, completed={completed:,}"
             )
