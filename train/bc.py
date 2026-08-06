@@ -1,392 +1,293 @@
-"""Behavioral cloning sample: supervised loop on expert move sequences.
+"""Behavioral-cloning training for PPO-compatible replay shards.
 
-Same observation / augment / mask pipeline as self-play PPO, but actions come
-from a fixed list instead of the policy. Train with action NLL.
+This module intentionally starts from fresh weights while retaining the S
+transformer architecture and categorical value head. The collected replay
+observations are 24x24, so only the spatial input/action dimensions differ
+from the original 12x12 S checkpoints.
 
-Expert actions shape convention (matches env.step):
-    (T, N, 2, 5)  — time, envs, both seats, [pass, row, col, dir, split]
-
-Run as a sketch:
-
-    python -m train.bc
+The remaining training pipeline is layered on top of the initialization in
+this file: double-buffered shard streaming, one-pass shard updates, EMA,
+epoch evaluation, and checkpointing.
 """
 
 from __future__ import annotations
 
-from functools import partial
+import argparse
+import json
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
-import jax
-import jax.numpy as jnp
-import jax.random as jrandom
-import numpy as np
 import equinox as eqx
+import jax
+import jax.random as jrandom
 import optax
-from datasets import load_dataset
+from ruamel.yaml import YAML
 
-from generals.core.env import GeneralsEnv, TimeStep
-from generals.core.game import get_observation, create_initial_state, step as game_step
-from generals.core.action import compute_valid_move_mask, create_action
-
-from networks import get_network_bundle, build_network, obs_to_array, reset_done_envs
 from config import Config
-from train.rewards import win_lose_reward
+from networks import build_network, get_network_bundle
 
 
-# ---- Expert data: HuggingFace replays → grids + move sequences ----
-
-HF_DATASET = "strakammm/generals_io_replays"
-PAD_TO = 24  # pad with mountains / hills (-2); dataset maps are 17–23
-
-PASS = np.asarray(create_action(to_pass=True), dtype=np.int32)
-DELTA_TO_DIR = {
-    (-1, 0): 0,  # UP
-    (1, 0): 1,   # DOWN
-    (0, -1): 2,  # LEFT
-    (0, 1): 3,   # RIGHT
-}
+BC_PAD_TO = 24
+BC_NUM_ACTIONS = 9 * BC_PAD_TO * BC_PAD_TO
 
 
-def tile_to_rc(tile: int, width: int) -> tuple[int, int]:
-    return divmod(int(tile), int(width))
+@dataclass(frozen=True)
+class BCTrainConfig:
+    """Configuration specific to the offline BC training process."""
 
-
-def tiles_to_direction(start_tile: int, end_tile: int, width: int) -> int:
-    sr, sc = tile_to_rc(start_tile, width)
-    er, ec = tile_to_rc(end_tile, width)
-    key = (er - sr, ec - sc)
-    if key not in DELTA_TO_DIR:
-        raise ValueError(f"non-adjacent move {start_tile}->{end_tile} (delta={key})")
-    return DELTA_TO_DIR[key]
-
-
-def dataset_move_to_action(start_tile: int, end_tile: int, is_50: int, width: int) -> np.ndarray:
-    """Convert one HF move into env action [pass, row, col, direction, split]."""
-    row, col = tile_to_rc(start_tile, width)
-    direction = tiles_to_direction(start_tile, end_tile, width)
-    return np.array([0, row, col, direction, int(is_50)], dtype=np.int32)
-
-
-def replay_to_grid(replay: dict[str, Any], pad_to: int = PAD_TO) -> np.ndarray:
-    """Build a padded numeric grid from one HF replay (pad with mountains / hills)."""
-    h, w = int(replay["mapHeight"]), int(replay["mapWidth"])
-    if h > pad_to or w > pad_to:
-        raise ValueError(f"map {(h, w)} exceeds pad_to={pad_to}")
-
-    grid = np.zeros((h, w), dtype=np.int32)
-    for tile in replay["mountains"]:
-        r, c = tile_to_rc(tile, w)
-        grid[r, c] = -2
-    for tile, army in zip(replay["cities"], replay["cityArmies"]):
-        r, c = tile_to_rc(tile, w)
-        grid[r, c] = int(army)
-    for player, tile in enumerate(replay["generals"]):
-        r, c = tile_to_rc(tile, w)
-        grid[r, c] = player + 1  # 1 or 2
-
-    padded = np.full((pad_to, pad_to), -2, dtype=np.int32)
-    padded[:h, :w] = grid
-    return padded
-
-
-def replay_to_actions(replay: dict[str, Any], truncation: int) -> np.ndarray:
-    """Build a (T, 2, 5) action sequence from HF moves; missing turns stay pass."""
-    w = int(replay["mapWidth"])
-    seq = np.broadcast_to(np.stack([PASS, PASS]), (truncation, 2, 5)).copy()
-    for move in replay["moves"]:
-        player, start, end, is_50, turn = (int(x) for x in move)
-        if turn >= truncation:
-            continue
-        seq[turn, player] = dataset_move_to_action(start, end, is_50, w)
-    return seq
-
-
-def load_expert_batch(
-    num_envs: int,
-    truncation: int,
-    pad_to: int = PAD_TO,
-    seed: int = 0,
-    split: str = "train",
-) -> tuple[Any, jnp.ndarray]:
-    """Load HF replays and build batched initial states + expert actions.
-
-    Returns:
-        states: batched GameState (N, ...) from padded custom maps
-        expert_actions: (T, N, 2, 5) int32
-    """
-    print(f"Loading HuggingFace dataset {HF_DATASET!r}...")
-    dataset = load_dataset(HF_DATASET)
-    train_dataset = dataset[split]
-    print(f"Replays: {len(train_dataset)}")
-
-    rng = np.random.default_rng(seed)
-    idxs = rng.choice(len(train_dataset), size=num_envs, replace=False)
-    replays = [train_dataset[int(i)] for i in idxs]
-
-    grids = jnp.stack([jnp.asarray(replay_to_grid(r, pad_to)) for r in replays])
-    actions_nt = jnp.stack(
-        [jnp.asarray(replay_to_actions(r, truncation)) for r in replays]
-    )  # (N, T, 2, 5)
-    expert_actions = jnp.transpose(actions_nt, (1, 0, 2, 3))  # (T, N, 2, 5)
-    states = jax.vmap(create_initial_state)(grids)
-    return states, expert_actions
-
-
-# ---- Collect: fixed moves → (obs, mask, temporal, action) -------------------
-
-
-def _step_no_reset(state, actions, truncation: int):
-    """Game step without pool auto-reset (needed for fixed demo maps)."""
-    new_state, info = game_step(state, actions)
-    terminated = info.is_done
-    truncated = (new_state.time >= truncation) & ~terminated
-    reward_p0 = jnp.where(info.winner == 0, 1.0, jnp.where(info.winner == 1, -1.0, 0.0))
-    rewards = jnp.array([reward_p0, -reward_p0])
-    obs_p0 = get_observation(new_state, 0)
-    obs_p1 = get_observation(new_state, 1)
-    observation = jax.tree.map(lambda a, b: jnp.stack([a, b], axis=0), obs_p0, obs_p1)
-    timestep = TimeStep(
-        observation=observation,
-        reward=rewards,
-        terminated=terminated,
-        truncated=truncated,
-        info=info,
-        last_state=new_state,
+    model_config: Path = Path("configs/S.yaml")
+    data_dir: Path = Path("/content/drive/MyDrive/generals_bc/shards")
+    stage_dir: Path = Path("/content/bc_stage")
+    checkpoint_dir: Path = Path(
+        "/content/drive/MyDrive/generals_bc/checkpoints"
     )
-    return timestep, new_state
+    metrics_path: Path = Path(
+        "/content/drive/MyDrive/generals_bc/metrics.jsonl"
+    )
+
+    s500_checkpoint: Path = Path("S/S_500/S_500.eqx")
+    s500_config: Path = Path("S/S_500/config.yaml")
+    s750_checkpoint: Path = Path("S/S_750/S_750.eqx")
+    s750_config: Path = Path("S/S_750/config.yaml")
+
+    seed: int = 44
+    max_epochs: int = 50
+    minibatch_size: int = 2_048
+    value_beta: float = 0.25
+    ema_decay: float = 0.999
+    checkpoint_every: int = 5
+
+    initial_lr: float = 1e-4
+    minimum_lr: float = 5e-6
+    lr_decay_factor: float = 0.5
+    lr_plateau_patience: int = 2
+
+    eval_games_per_opponent: int = 50
+    eval_seed: int = 12_345
+    skip_eval: bool = False
+
+    @property
+    def run_config_path(self) -> Path:
+        return self.checkpoint_dir / "run_config.json"
 
 
-@partial(jax.jit, static_argnames=["env", "num_steps", "augment_fn", "truncation"])
-def collect_bc_rollout(
-    states,
-    env,
-    expert_actions,
-    key,
-    num_steps,
-    obs_state_p0,
-    obs_state_p1,
-    augment_fn,
-    pool=None,
-    truncation: int = 1001,
-):
-    """Drive N games with expert actions; record both seats as supervised pairs.
+def make_bc_model_config(path: str | Path) -> Config:
+    """Load S architecture settings and adapt only its spatial size to BC data."""
 
-    Args:
-        states: batched GameState (N, ...)
-        expert_actions: (T, N, 2, 5)
-        obs_state_*: AugmentedObsState batched (N, ...)
-
-    Returns:
-        final_states, data, key, osp0, osp1
-        data fields are (T, 2N, ...): obs, masks, temporal, actions, rewards,
-        terminated, truncated  (rewards useful if you also fit a value head)
-    """
-    n = states.armies.shape[0]
-    if pool is not None:
-        step_fn = lambda s, a: env.step(s, a, pool)
-    else:
-        step_fn = lambda s, a: _step_no_reset(s, a, truncation)
-    cat = lambda a, b: jax.tree.map(lambda x, y: jnp.concatenate([x, y]), a, b)
-    osp_init = cat(obs_state_p0, obs_state_p1)
-
-    def scan_body(carry, expert_t):
-        # expert_t: (N, 2, 5)
-        states, key, osp = carry
-
-        obs_p0 = jax.vmap(lambda s: get_observation(s, 0))(states)
-        obs_p1 = jax.vmap(lambda s: get_observation(s, 1))(states)
-        obs_both = cat(obs_p0, obs_p1)
-        obs_arr = jax.vmap(obs_to_array)(obs_both)
-        masks = jax.vmap(
-            lambda o: compute_valid_move_mask(o.armies, o.owned_cells, o.mountains)
-        )(obs_both)
-        obs_aug, new_osp = jax.vmap(augment_fn)(obs_arr, osp)
-        temporal = jnp.stack(
-            [new_osp.opponent_army_history, new_osp.opponent_land_history], axis=1
+    source = Config.from_yaml(str(path))
+    if source.network != "history_transformer":
+        raise ValueError(
+            f"BC requires history_transformer, found {source.network!r}"
+        )
+    if source.value_loss != "ce":
+        raise ValueError(
+            "BC retains S's categorical value head; expected value_loss='ce'"
         )
 
-        # Expert actions for both seats → (2N, 5)
-        a0, a1 = expert_t[:, 0], expert_t[:, 1]
-        actions = jnp.concatenate([a0, a1], axis=0)
-
-        timesteps, new_states = jax.vmap(step_fn)(states, expert_t)
-
-        terminated = timesteps.terminated
-        truncated = timesteps.truncated
-        winners = timesteps.info.winner
-
-        next_obs_p0 = jax.vmap(lambda s: get_observation(s, 0))(timesteps.last_state)
-        next_obs_p1 = jax.vmap(lambda s: get_observation(s, 1))(timesteps.last_state)
-        rewards_p0 = win_lose_reward(obs_p0, a0, next_obs_p0, winners)
-        winners_p1 = jnp.where(winners >= 0, 1 - winners, winners)
-        rewards_p1 = win_lose_reward(obs_p1, a1, next_obs_p1, winners_p1)
-
-        dones_both = jnp.concatenate([terminated | truncated, terminated | truncated])
-        osp = reset_done_envs(new_osp, dones_both)
-
-        data = (
-            obs_aug.astype(jnp.bfloat16),
-            masks,
-            temporal,
-            actions,
-            jnp.concatenate([rewards_p0, rewards_p1]),
-            jnp.concatenate([terminated, terminated]),
-            jnp.concatenate([truncated, truncated]),
-        )
-        return (new_states, key, osp), data
-
-    (final_states, final_key, final_osp), rollout = jax.lax.scan(
-        scan_body,
-        (states, key, osp_init),
-        expert_actions,  # scanned over T
-        length=num_steps,
+    # Fresh model with S depth/width/patch/value design. Replay observations and
+    # targets are 24x24, yielding a 5,184-class policy head.
+    return replace(
+        source,
+        run_name="BC_S_24",
+        pad_to=BC_PAD_TO,
+        min_grid_size=17,
+        max_grid_size=23,
+        init_checkpoint="",
+        ema_checkpoint="",
+        minibatch_size=2_048,
+        use_bf16=True,
+        value_loss="ce",
+        num_bins=128,
+        v_min=-1.0,
+        v_max=1.0,
+        hl_sigma=0.04,
     )
-    final_osp0 = jax.tree.map(lambda x: x[:n], final_osp)
-    final_osp1 = jax.tree.map(lambda x: x[n:], final_osp)
-    return final_states, rollout, final_key, final_osp0, final_osp1
 
 
-# ---- Supervised update ------------------------------------------------------
+def make_optimizer(max_grad_norm: float) -> optax.GradientTransformation:
+    """Adam with PPO's global gradient clipping and externally supplied LR."""
 
-
-def bc_update(network, opt_state, batch, optimizer, key, minibatch_size):
-    """One BC epoch: minimize -log π(a_expert | s) on shuffled minibatches."""
-    obs, masks, temporal, actions, train_mask = batch
-    total = obs.shape[0] * obs.shape[1]
-
-    obs_f = obs.reshape(total, *obs.shape[2:])
-    masks_f = masks.reshape(total, *masks.shape[2:])
-    temporal_f = temporal.reshape(total, *temporal.shape[2:])
-    actions_f = actions.reshape(total, -1)
-    mask_f = train_mask.reshape(-1)
-
-    # Keep non-truncated steps (same idea as PPO train_mask)
-    valid_idx = jnp.where(mask_f > 0.5, size=total, fill_value=0)[0]
-    n_valid = int(jnp.maximum(mask_f.sum(), 1.0))
-    n_keep = (n_valid // minibatch_size) * minibatch_size
-    n_keep = max(n_keep, minibatch_size)
-    sample_idx = valid_idx[:n_keep]
-
-    n_samples = sample_idx.shape[0]
-    num_batches = max(n_samples // minibatch_size, 1)
-    perm = jrandom.permutation(key, n_samples)
-    shuffled = sample_idx[perm][: num_batches * minibatch_size]
-    idx_mb = shuffled.reshape(num_batches, minibatch_size)
-
-    def scan_body(carry, mb_idx):
-        network, opt_state = carry
-        mb_obs = obs_f[mb_idx]
-        mb_masks = masks_f[mb_idx]
-        mb_temporal = temporal_f[mb_idx]
-        mb_actions = actions_f[mb_idx]
-
-        def loss_fn(net):
-            def single(o, m, td, a):
-                # Pass expert action → network returns log π(a|s)
-                _, _, lp, ent, _, _ = net(o, m, td, None, a)
-                return -lp, ent
-
-            nlls, ents = jax.vmap(single)(mb_obs, mb_masks, mb_temporal, mb_actions)
-            return nlls.mean(), {"nll": nlls.mean(), "entropy": ents.mean()}
-
-        (loss, stats), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(network)
-        updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(network, eqx.is_array))
-        network = eqx.apply_updates(network, updates)
-        return (network, opt_state), stats
-
-    (network, opt_state), stats = jax.lax.scan(
-        scan_body, (network, opt_state), idx_mb
+    # Learning rate is applied to updates inside the eventual train step. This
+    # keeps Adam state intact when the epoch-level plateau schedule changes LR.
+    return optax.chain(
+        optax.clip_by_global_norm(max_grad_norm),
+        optax.scale_by_adam(),
     )
-    # Average stats over minibatches
-    stats = jax.tree.map(lambda x: x.mean(), stats)
-    return network, opt_state, stats
 
 
-# ---- Tiny training loop (sample) --------------------------------------------
+def initialize_training(
+    cfg: BCTrainConfig,
+) -> tuple[
+    Config,
+    Any,
+    Any,
+    optax.OptState,
+    optax.GradientTransformation,
+    Any,
+    jax.Array,
+]:
+    """Create fresh network, optimizer state, EMA weights, and PRNG state."""
 
+    if not 0.0 < cfg.ema_decay < 1.0:
+        raise ValueError("ema_decay must be between zero and one")
+    if cfg.minibatch_size <= 0:
+        raise ValueError("minibatch_size must be positive")
+    if cfg.value_beta < 0:
+        raise ValueError("value_beta must be non-negative")
+    if cfg.eval_games_per_opponent <= 0 or cfg.eval_games_per_opponent % 2:
+        raise ValueError("eval_games_per_opponent must be positive and even")
 
-def train_bc(cfg: Config | None = None, num_iters: int = 3):
-    """Minimal BC loop: HF demos → collect on custom maps → supervised update."""
-    cfg = cfg or Config(
-        pad_to=PAD_TO,
-        min_grid_size=PAD_TO,
-        max_grid_size=PAD_TO,
-        num_envs=4,
-        num_steps=32,
-    )
-    object.__setattr__(cfg, "pad_to", PAD_TO)
-    # Smaller net defaults for a smoke sample
-    object.__setattr__(cfg, "depth", min(cfg.depth, 2))
-    object.__setattr__(cfg, "embed_dim", min(cfg.embed_dim, 64))
-    object.__setattr__(cfg, "conv_dim", min(cfg.conv_dim, 64))
-    object.__setattr__(cfg, "minibatch_size", min(cfg.minibatch_size, 64))
-
-    bundle = get_network_bundle(cfg.network)
-    augment_fn = bundle["augment_obs"]
-    init_obs_state_fn = bundle["init_obs_state"]
+    model_cfg = make_bc_model_config(cfg.model_config)
+    model_cfg = replace(model_cfg, minibatch_size=cfg.minibatch_size)
+    bundle = get_network_bundle(model_cfg.network)
 
     key = jrandom.PRNGKey(cfg.seed)
-    key, net_key = jrandom.split(key)
-    network = build_network(cfg, net_key)
-    optimizer = optax.adam(1e-4)
-    opt_state = optimizer.init(eqx.filter(network, eqx.is_array))
+    key, network_key = jrandom.split(key)
+    network = build_network(model_cfg, network_key)
 
-    # Custom maps + expert moves from HuggingFace (pad with mountains / hills)
-    init_states, expert = load_expert_batch(
-        num_envs=cfg.num_envs,
-        truncation=cfg.num_steps,
-        pad_to=PAD_TO,
-        seed=cfg.seed,
-    )
-    num_steps = int(expert.shape[0])
-
-    env = GeneralsEnv(
-        min_grid_size=PAD_TO,
-        max_grid_size=PAD_TO,
-        pad_to=PAD_TO,
-        truncation=cfg.truncation,
-        pool_size=min(cfg.pool_size, 256),
-    )
-
-    osp_template = jax.tree.map(
-        lambda x: jnp.tile(x, (cfg.num_envs, *([1] * x.ndim))),
-        init_obs_state_fn(PAD_TO, PAD_TO),
-    )
-
-    print(f"BC sample | envs={cfg.num_envs} steps={num_steps} pad={PAD_TO}")
-
-    for it in range(num_iters):
-        key, roll_key, upd_key = jrandom.split(key, 3)
-        # Replay the same demo maps from t=0 each iter (no pool auto-reset)
-        states = jax.tree.map(lambda x: x.copy(), init_states)
-        osp0 = jax.tree.map(lambda x: x.copy(), osp_template)
-        osp1 = jax.tree.map(lambda x: x.copy(), osp_template)
-        states, data, roll_key, osp0, osp1 = collect_bc_rollout(
-            states,
-            env,
-            expert,
-            roll_key,
-            num_steps,
-            osp0,
-            osp1,
-            augment_fn,
-            pool=None,
-            truncation=cfg.truncation,
+    if network.pad_to != BC_PAD_TO:
+        raise AssertionError(f"network pad_to={network.pad_to}, expected 24")
+    if model_cfg.num_actions != BC_NUM_ACTIONS:
+        raise AssertionError(
+            f"action count={model_cfg.num_actions}, expected {BC_NUM_ACTIONS}"
         )
-        obs, masks, temporal, actions, _rews, _term, trunc = data
-        train_mask = 1.0 - trunc.astype(jnp.float32)
-        batch = (obs, masks, temporal, actions, train_mask)
-
-        network, opt_state, stats = bc_update(
-            network, opt_state, batch, optimizer, upd_key, cfg.minibatch_size
+    if network.num_bins != 128:
+        raise AssertionError(
+            f"value bins={network.num_bins}, expected S's 128-bin head"
         )
-        print(f"  iter {it + 1}/{num_iters}  nll={float(stats['nll']):.4f}  ent={float(stats['entropy']):.3f}")
 
-    return network
+    optimizer = make_optimizer(model_cfg.max_grad_norm)
+    trainable = eqx.filter(network, eqx.is_array)
+    opt_state = optimizer.init(trainable)
+    ema_network = jax.tree.map(
+        lambda value: value.copy() if eqx.is_array(value) else value,
+        network,
+    )
+    return (
+        model_cfg,
+        bundle,
+        network,
+        opt_state,
+        optimizer,
+        ema_network,
+        key,
+    )
 
 
-def main():
-    train_bc()
+def _parameter_count(network: Any) -> int:
+    arrays = jax.tree.leaves(eqx.filter(network, eqx.is_array))
+    return sum(array.size for array in arrays)
+
+
+def _write_startup_config(cfg: BCTrainConfig, model_cfg: Config) -> None:
+    cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    cfg.metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "bc": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in cfg.__dict__.items()
+        },
+        "model": model_cfg.to_dict(),
+        "policy_classes": BC_NUM_ACTIONS,
+        "initialization": "fresh",
+    }
+    with cfg.run_config_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+    # Agent.load consumes this YAML next to BC checkpoints during evaluation.
+    yaml = YAML()
+    yaml.default_flow_style = False
+    with (cfg.checkpoint_dir / "config.yaml").open("w", encoding="utf-8") as handle:
+        yaml.dump(model_cfg.to_dict(), handle)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=Path("configs/S.yaml"))
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("/content/drive/MyDrive/generals_bc/shards"),
+    )
+    parser.add_argument("--stage-dir", type=Path, default=Path("/content/bc_stage"))
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=Path("/content/drive/MyDrive/generals_bc/checkpoints"),
+    )
+    parser.add_argument(
+        "--metrics-path",
+        type=Path,
+        default=Path("/content/drive/MyDrive/generals_bc/metrics.jsonl"),
+    )
+    parser.add_argument("--seed", type=int, default=44)
+    parser.add_argument("--max-epochs", type=int, default=50)
+    parser.add_argument("--minibatch-size", type=int, default=2_048)
+    parser.add_argument("--skip-eval", action="store_true")
+    parser.add_argument(
+        "--initialize-only",
+        action="store_true",
+        help="build and validate fresh model state, then exit",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    # Match PPO's high-throughput matmul policy on Ampere and newer GPUs.
+    jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+    args = parse_args()
+    cfg = BCTrainConfig(
+        model_config=args.config,
+        data_dir=args.data_dir,
+        stage_dir=args.stage_dir,
+        checkpoint_dir=args.checkpoint_dir,
+        metrics_path=args.metrics_path,
+        seed=args.seed,
+        max_epochs=args.max_epochs,
+        minibatch_size=args.minibatch_size,
+        skip_eval=args.skip_eval,
+    )
+
+    devices = jax.devices()
+    print(f"JAX devices: {devices}")
+    (
+        model_cfg,
+        _,
+        network,
+        _,
+        _,
+        ema_network,
+        _,
+    ) = initialize_training(cfg)
+    _write_startup_config(cfg, model_cfg)
+
+    print("Initialized fresh BC model")
+    print(
+        f"architecture=S history_transformer depth={model_cfg.depth} "
+        f"embed={model_cfg.embed_dim} heads={model_cfg.n_head}"
+    )
+    print(
+        f"input={BC_PAD_TO}x{BC_PAD_TO} actions={BC_NUM_ACTIONS:,} "
+        f"value_head={model_cfg.num_bins}-bin HL-Gauss"
+    )
+    print(
+        f"minibatch={cfg.minibatch_size:,} bf16={model_cfg.use_bf16} "
+        f"grad_clip={model_cfg.max_grad_norm} ema={cfg.ema_decay}"
+    )
+    print(f"parameters={_parameter_count(network):,}")
+    print(f"checkpoint config: {cfg.run_config_path}")
+
+    # Ensure the EMA tree is structurally identical at initialization.
+    if jax.tree.structure(network) != jax.tree.structure(ema_network):
+        raise AssertionError("EMA tree does not match network tree")
+
+    if not args.initialize_only:
+        raise NotImplementedError(
+            "BC initialization is complete; streaming and epoch training are "
+            "the next implementation layer. Run with --initialize-only for now."
+        )
 
 
 if __name__ == "__main__":
