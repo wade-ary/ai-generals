@@ -167,12 +167,14 @@ def run_test(output_dir: Path, require_gpu: bool, overwrite: bool) -> None:
         game_batch_size=NUM_GAMES,
         turns_per_shard=TURNS_PER_SHARD,
         max_games=NUM_GAMES,
+        diagnose_illegal=True,
     )
 
     shard_paths = sorted(output_dir.glob("bc_batch_*.npz"))
     assert shard_paths, "collector produced no shards"
     assert (output_dir / "manifest.json").is_file(), "manifest.json missing"
     assert (output_dir / "game_winners.json").is_file(), "game_winners.json missing"
+    assert (output_dir / "illegal_moves.json").is_file(), "illegal_moves.json missing"
     assert not list(output_dir.glob("*.tmp")), "temporary output file was left behind"
 
     seen_samples: set[tuple[str, int, int]] = set()
@@ -190,6 +192,7 @@ def run_test(output_dir: Path, require_gpu: bool, overwrite: bool) -> None:
 
     manifest = _load_json(output_dir / "manifest.json")
     winners = _load_json(output_dir / "game_winners.json")
+    illegal_events = _load_json(output_dir / "illegal_moves.json")["events"]
 
     assert manifest["games_requested"] == NUM_GAMES
     assert manifest["game_batch_size"] == NUM_GAMES
@@ -200,6 +203,8 @@ def run_test(output_dir: Path, require_gpu: bool, overwrite: bool) -> None:
     assert manifest["replay_priority"] == (
         "alternating_player_1_first_on_even_turns"
     )
+    assert manifest["diagnose_illegal"] is True
+    assert manifest["illegal_moves"] == len(illegal_events)
     assert manifest["samples"] == total_rows, (
         f"manifest samples={manifest['samples']} but shards contain {total_rows}"
     )
@@ -213,12 +218,16 @@ def run_test(output_dir: Path, require_gpu: bool, overwrite: bool) -> None:
     )
     assert sampled_ids.issubset(source_ids)
 
-    # These curated replays should replay cleanly. Treat any cancellation as a
-    # failed smoke test rather than silently accepting partial data.
+    # Diagnostic mode continues invalid commands as no-ops, so no simulation
+    # game should be cancelled. The event report below reveals isolated versus
+    # cascading failures without storing invalid commands as BC targets.
     assert manifest["failed"] == 0, (
-        f"{manifest['failed']} of 10 real games diverged; inspect collector output"
+        f"diagnostic mode unexpectedly cancelled {manifest['failed']} games"
     )
     assert len(winners) == NUM_GAMES, "not all ten games received an outcome"
+    for event in illegal_events:
+        sample = (event["game_id"], event["player"], event["turn"])
+        assert sample not in seen_samples, f"invalid action was stored: {sample}"
 
     print("\nALL CHECKS PASSED")
     print(f"games:       {NUM_GAMES}")
@@ -232,6 +241,19 @@ def run_test(output_dir: Path, require_gpu: bool, overwrite: bool) -> None:
     print(f"winner counts: p0={list(winners.values()).count(0)}, "
           f"p1={list(winners.values()).count(1)}, "
           f"draw={list(winners.values()).count(-1)}")
+    print(f"illegal commands excluded: {len(illegal_events)}")
+    events_by_game: dict[str, list[dict]] = {}
+    for event in illegal_events:
+        events_by_game.setdefault(event["game_id"], []).append(event)
+    for game_id, events in sorted(events_by_game.items()):
+        turns = [event["turn"] for event in events]
+        classification = "isolated" if len(events) == 1 else "cascading/repeated"
+        reasons = sorted({reason for event in events for reason in event["reasons"]})
+        print(
+            f"  {game_id}: {classification}, count={len(events)}, "
+            f"turns={turns}, reasons={reasons}"
+        )
+    print(f"diagnostics: {(output_dir / 'illegal_moves.json').resolve()}")
     print(f"output:      {output_dir.resolve()}")
 
 

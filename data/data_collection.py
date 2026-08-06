@@ -374,16 +374,16 @@ def _actions_are_legal(
     actions: np.ndarray,
     has_move: np.ndarray,
 ) -> np.ndarray:
-    """Return one boolean per game; both recorded moves must be pre-step legal."""
+    """Return pre-step legality for each player action; passes/padding are true."""
 
     mask_host = np.asarray(masks)
-    legal = np.ones(actions.shape[0], dtype=np.bool_)
+    legal = np.ones(actions.shape[:2], dtype=np.bool_)
     for player in (0, 1):
         movers = np.flatnonzero(has_move[:, player])
         if len(movers) == 0:
             continue
         mover_actions = actions[movers, player]
-        legal[movers] &= mask_host[
+        legal[movers, player] = mask_host[
             movers,
             player,
             mover_actions[:, 1],
@@ -393,12 +393,74 @@ def _actions_are_legal(
     return legal
 
 
+def _illegal_move_event(
+    states: GameState,
+    actions: np.ndarray,
+    game_id: str,
+    game_index: int,
+    player: int,
+    turn: int,
+) -> dict[str, Any]:
+    """Capture enough state to distinguish isolated no-ops from divergence."""
+
+    action = actions[game_index, player].astype(np.int32)
+    _, row, col, direction, _ = action
+    deltas = np.asarray(((-1, 0), (1, 0), (0, -1), (0, 1)))
+    dest_row, dest_col = (np.array((row, col)) + deltas[direction]).tolist()
+    armies = np.asarray(states.armies[game_index])
+    ownership = np.asarray(states.ownership[game_index])
+    mountains = np.asarray(states.mountains[game_index])
+    source_owned = bool(ownership[player, row, col])
+    source_army = int(armies[row, col])
+    destination_in_bounds = (
+        0 <= dest_row < armies.shape[0] and 0 <= dest_col < armies.shape[1]
+    )
+    destination_mountain = (
+        bool(mountains[dest_row, dest_col]) if destination_in_bounds else None
+    )
+    if ownership[0, row, col]:
+        source_owner = 0
+    elif ownership[1, row, col]:
+        source_owner = 1
+    else:
+        source_owner = -1
+
+    reasons: list[str] = []
+    if not source_owned:
+        reasons.append("source_not_owned")
+    if source_army <= 1:
+        reasons.append("source_army_le_1")
+    if not destination_in_bounds:
+        reasons.append("destination_out_of_bounds")
+    elif destination_mountain:
+        reasons.append("destination_mountain")
+
+    return {
+        "game_id": game_id,
+        "turn": int(turn),
+        "state_time": int(np.asarray(states.time[game_index])),
+        "player": int(player),
+        "first_player": int(1 - (turn % 2)),
+        "action": action.tolist(),
+        "both_actions": actions[game_index].astype(np.int32).tolist(),
+        "source": [int(row), int(col)],
+        "destination": [int(dest_row), int(dest_col)],
+        "source_owner": source_owner,
+        "source_army": source_army,
+        "destination_in_bounds": destination_in_bounds,
+        "destination_mountain": destination_mountain,
+        "reasons": reasons or ["unknown_mask_failure"],
+    }
+
+
 def _collect_game_batch(
     replays: Sequence[Mapping[str, Any]],
     output_dir: Path,
     batch_index: int,
     turns_per_shard: int,
     winner_lookup: dict[str, int],
+    illegal_move_events: list[dict[str, Any]],
+    diagnose_illegal: bool,
 ) -> dict[str, int]:
     """Simulate one game batch through completion, flushing turn chunks."""
 
@@ -417,7 +479,13 @@ def _collect_game_batch(
             print(f"  cancel {game_id}: cleaning failed: {error}")
 
     if not grids:
-        return {"completed": 0, "draws": 0, "failed": preprocessing_failed, "samples": 0}
+        return {
+            "completed": 0,
+            "draws": 0,
+            "failed": preprocessing_failed,
+            "samples": 0,
+            "illegal_moves": 0,
+        }
 
     ids = np.asarray(game_ids, dtype=str)
     states = jax.vmap(create_initial_state)(jnp.asarray(np.stack(grids)))
@@ -434,6 +502,7 @@ def _collect_game_batch(
     failed = np.zeros(len(grids), dtype=np.bool_)
     completed = np.zeros(len(grids), dtype=np.bool_)
     samples_written = 0
+    illegal_start = len(illegal_move_events)
 
     for chunk_index, turn_start in enumerate(range(0, max_turn, turns_per_shard)):
         turn_stop = min(turn_start + turns_per_shard, max_turn)
@@ -454,17 +523,32 @@ def _collect_game_batch(
                 _ppo_inputs_and_next_history(states, obs_states)
             )
 
-            legal = _actions_are_legal(masks, actions, has_move)
-            newly_failed = active & ~legal
-            if np.any(newly_failed):
-                for game_index in np.flatnonzero(newly_failed):
+            legal_actions = _actions_are_legal(masks, actions, has_move)
+            illegal_actions = has_move & active[:, None] & ~legal_actions
+            for game_index, player in zip(*np.nonzero(illegal_actions)):
+                event = _illegal_move_event(
+                    states, actions, ids[game_index], game_index, player, turn
+                )
+                illegal_move_events.append(event)
+                print(
+                    f"  diagnostic {ids[game_index]} turn={turn} p={player} "
+                    f"reasons={','.join(event['reasons'])} "
+                    f"source_army={event['source_army']}"
+                )
+
+            illegal_games = active & np.any(illegal_actions, axis=1)
+            if not diagnose_illegal and np.any(illegal_games):
+                for game_index in np.flatnonzero(illegal_games):
                     print(
                         f"  cancel {ids[game_index]}: illegal/divergent move at turn {turn}"
                     )
-                failed |= newly_failed
-                active &= ~newly_failed
+                failed |= illegal_games
+                active &= ~illegal_games
 
-            selected = has_move & active[:, None]
+            # Diagnostic no-ops are never BC targets. The environment already
+            # ignores them, allowing us to observe whether later moves recover
+            # or cascade into further failures.
+            selected = has_move & legal_actions & active[:, None]
             _append_selected_samples(
                 buffer, augmented, masks, temporal, actions, selected, ids, turn
             )
@@ -525,6 +609,7 @@ def _collect_game_batch(
         "draws": sum(winner_lookup.get(game_id) == -1 for game_id in ids),
         "failed": int(failed.sum()) + preprocessing_failed,
         "samples": samples_written,
+        "illegal_moves": len(illegal_move_events) - illegal_start,
     }
 
 
@@ -536,6 +621,7 @@ def collect_dataset(
     game_batch_size: int = GAME_BATCH_SIZE,
     turns_per_shard: int = TURNS_PER_SHARD,
     max_games: int | None = None,
+    diagnose_illegal: bool = False,
 ) -> None:
     """Collect one sequential epoch over the requested Hugging Face split."""
 
@@ -545,6 +631,7 @@ def collect_dataset(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     winner_path = output_dir / "game_winners.json"
+    illegal_path = output_dir / "illegal_moves.json"
 
     print(f"Loading Hugging Face dataset {dataset_name!r}, split={split!r}...")
     dataset = load_dataset(dataset_name, split=split)
@@ -558,7 +645,14 @@ def collect_dataset(
     )
 
     winner_lookup: dict[str, int] = {}
-    totals = {"completed": 0, "draws": 0, "failed": 0, "samples": 0}
+    totals = {
+        "completed": 0,
+        "draws": 0,
+        "failed": 0,
+        "samples": 0,
+        "illegal_moves": 0,
+    }
+    illegal_move_events: list[dict[str, Any]] = []
     started = time.monotonic()
 
     for batch_index, start in enumerate(range(0, total_games, game_batch_size)):
@@ -571,6 +665,8 @@ def collect_dataset(
             batch_index,
             turns_per_shard,
             winner_lookup,
+            illegal_move_events,
+            diagnose_illegal,
         )
         for key in totals:
             totals[key] += stats[key]
@@ -578,6 +674,7 @@ def collect_dataset(
         # Persist outcomes after every outer batch so completed work survives an
         # interruption. Failed/cancelled games are intentionally absent.
         _write_json_atomic(winner_path, winner_lookup)
+        _write_json_atomic(illegal_path, {"events": illegal_move_events})
         elapsed = time.monotonic() - started
         print(
             f"  progress games={stop:,}/{total_games:,}, "
@@ -595,6 +692,7 @@ def collect_dataset(
         "history_size": HISTORY_SIZE,
         "temporal_window": TEMPORAL_WINDOW,
         "replay_priority": "alternating_player_1_first_on_even_turns",
+        "diagnose_illegal": diagnose_illegal,
         "storage_dtypes": {
             "obs": "float16",
             "action_mask": "bool",
@@ -612,6 +710,7 @@ def collect_dataset(
     _write_json_atomic(output_dir / "manifest.json", manifest)
     print(f"Done. Manifest: {output_dir / 'manifest.json'}")
     print(f"Winners: {winner_path}")
+    print(f"Illegal-move diagnostics: {illegal_path}")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -622,6 +721,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-batch-size", type=int, default=GAME_BATCH_SIZE)
     parser.add_argument("--turns-per-shard", type=int, default=TURNS_PER_SHARD)
     parser.add_argument("--max-games", type=int)
+    parser.add_argument("--diagnose-illegal", action="store_true")
     return parser.parse_args()
 
 
@@ -634,6 +734,7 @@ def main() -> None:
         game_batch_size=args.game_batch_size,
         turns_per_shard=args.turns_per_shard,
         max_games=args.max_games,
+        diagnose_illegal=args.diagnose_illegal,
     )
 
 
