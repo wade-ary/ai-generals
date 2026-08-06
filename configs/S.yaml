@@ -27,7 +27,6 @@ castle_val_min: 13
 castle_val_max: 18
 
 network: history_transformer
-opponent: self
 reward_fn: relative_progress_reward
 
 depth: 4
@@ -67,29 +66,12 @@ eval_every: 50
 eval_games: 512
 ckpt_every: 500
 
-# Reference ELO eval (0 = disabled)
-ref_eval_every: 250
-ref_eval_games: 500
-ref_eval_dir: checkpoints/references/S_new
-ref_eval_min_grid_size: 11
-ref_eval_max_grid_size: 12
-ref_eval_min_generals_distance: 11
-ref_eval_max_generals_distance: 17
-ref_eval_num_cities_min: 2
-ref_eval_num_cities_max: 4
-ref_eval_castle_val_min: 13
-ref_eval_castle_val_max: 18
-ref_eval_truncation: 1024
+# Reference ELO disabled for a fresh Colab run. Normal evaluation against
+# random and curriculum progression remain enabled above.
+ref_eval_every: 0
+ref_eval_dir: ""
 
-ckpt_pool_size: 0
 save_every: 500
-
-# Population training (disabled by default)
-population_enabled: false
-population_extend_every: 1000
-population_max_size: 20
-population_initial_paths:
-best_cp_proportion: 0.75
 
 use_bf16: true
 

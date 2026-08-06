@@ -5,3 +5,8 @@ jax>=0.4.30
 jaxlib>=0.4.30
 datasets>=2.15.0
 torch>=2.0.0
+equinox
+optax
+jaxtyping
+ruamel.yaml
+wandb
