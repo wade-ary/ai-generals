@@ -23,8 +23,10 @@ For a small end-to-end check::
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +75,58 @@ class CleanMoves:
 
     actions: np.ndarray  # (T, 2, 5), int32
     has_move: np.ndarray  # (T, 2), bool
+
+
+class AsyncArchiver:
+    """Copy completed files to durable storage without blocking collection."""
+
+    def __init__(self, archive_dir: Path, delete_source: bool = False) -> None:
+        self.archive_dir = archive_dir
+        self.delete_source = delete_source
+        self.archive_dir.mkdir(parents=True, exist_ok=True)
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="bc-archive"
+        )
+        self._pending: list[concurrent.futures.Future[Path]] = []
+
+    def submit(self, source: Path) -> None:
+        """Queue one atomic copy and report any earlier background failure."""
+
+        self._raise_completed_errors()
+        self._pending.append(self._executor.submit(self._copy, source))
+
+    def _copy(self, source: Path) -> Path:
+        destination = self.archive_dir / source.name
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        try:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+        finally:
+            # Never leave a partial file looking like a completed shard.
+            if temporary.exists():
+                temporary.unlink()
+        if self.delete_source:
+            source.unlink()
+        return destination
+
+    def _raise_completed_errors(self) -> None:
+        remaining: list[concurrent.futures.Future[Path]] = []
+        for future in self._pending:
+            if future.done():
+                future.result()
+            else:
+                remaining.append(future)
+        self._pending = remaining
+
+    def close(self) -> None:
+        """Wait for queued copies and propagate background exceptions."""
+
+        try:
+            for future in self._pending:
+                future.result()
+        finally:
+            self._executor.shutdown(wait=True)
+        self._pending.clear()
 
 
 def initialise_map(replay: Mapping[str, Any], pad_to: int = PAD_TO) -> np.ndarray:
@@ -429,6 +483,7 @@ def _collect_rolling_pool(
     turns_per_shard: int,
     winner_lookup: dict[str, int],
     illegal_move_events: list[dict[str, Any]],
+    archiver: AsyncArchiver | None = None,
 ) -> dict[str, int]:
     """Collect all replays with immediate PPO-style slot replacement.
 
@@ -614,6 +669,8 @@ def _collect_rolling_pool(
         chunk_illegal = len(illegal_move_events) - chunk_illegal_start
         samples_written += chunk_samples
         if shard is not None:
+            if archiver is not None:
+                archiver.submit(shard)
             print(
                 f"  shard {shard.name}: samples={chunk_samples:,}, "
                 f"invalid_skipped={chunk_illegal:,}, "
@@ -646,6 +703,8 @@ def collect_dataset(
     game_batch_size: int = GAME_BATCH_SIZE,
     turns_per_shard: int = TURNS_PER_SHARD,
     max_games: int | None = None,
+    archive_dir: str | Path | None = None,
+    delete_after_archive: bool = False,
 ) -> None:
     """Collect one sequential epoch over the requested Hugging Face split."""
 
@@ -654,6 +713,16 @@ def collect_dataset(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = Path(archive_dir) if archive_dir is not None else None
+    if archive_path is not None and archive_path.resolve() == output_dir.resolve():
+        raise ValueError("archive_dir must differ from output_dir")
+    if delete_after_archive and archive_path is None:
+        raise ValueError("delete_after_archive requires archive_dir")
+    archiver = (
+        AsyncArchiver(archive_path, delete_after_archive)
+        if archive_path is not None
+        else None
+    )
     winner_path = output_dir / "game_winners.json"
     illegal_path = output_dir / "illegal_moves.json"
 
@@ -680,18 +749,23 @@ def collect_dataset(
     illegal_move_events: list[dict[str, Any]] = []
     started = time.monotonic()
 
-    if total_games:
-        stats = _collect_rolling_pool(
-            dataset,
-            total_games,
-            output_dir,
-            pool_size,
-            turns_per_shard,
-            winner_lookup,
-            illegal_move_events,
-        )
-        for key in totals:
-            totals[key] += stats[key]
+    try:
+        if total_games:
+            stats = _collect_rolling_pool(
+                dataset,
+                total_games,
+                output_dir,
+                pool_size,
+                turns_per_shard,
+                winner_lookup,
+                illegal_move_events,
+                archiver,
+            )
+            for key in totals:
+                totals[key] += stats[key]
+    finally:
+        if archiver is not None:
+            archiver.close()
     _write_json_atomic(winner_path, winner_lookup)
     _write_json_atomic(illegal_path, {"events": illegal_move_events})
     elapsed = time.monotonic() - started
@@ -707,6 +781,8 @@ def collect_dataset(
         "games_requested": total_games,
         "game_batch_size": game_batch_size,
         "rolling_pool_size": pool_size,
+        "archive_dir": str(archive_path) if archive_path is not None else None,
+        "delete_after_archive": delete_after_archive,
         "turns_per_shard": turns_per_shard,
         "pad_to": PAD_TO,
         "history_size": HISTORY_SIZE,
@@ -740,6 +816,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-batch-size", type=int, default=GAME_BATCH_SIZE)
     parser.add_argument("--turns-per-shard", type=int, default=TURNS_PER_SHARD)
     parser.add_argument("--max-games", type=int)
+    parser.add_argument(
+        "--archive-dir",
+        type=Path,
+        help="copy each completed shard here in a background thread",
+    )
+    parser.add_argument(
+        "--delete-after-archive",
+        action="store_true",
+        help="delete each local shard after its background archive succeeds",
+    )
     return parser.parse_args()
 
 
@@ -752,6 +838,8 @@ def main() -> None:
         game_batch_size=args.game_batch_size,
         turns_per_shard=args.turns_per_shard,
         max_games=args.max_games,
+        archive_dir=args.archive_dir,
+        delete_after_archive=args.delete_after_archive,
     )
 
 
