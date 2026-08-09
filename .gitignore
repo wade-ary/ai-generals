@@ -16,6 +16,7 @@ S/
 *.pkl
 *.ckpt
 *.h5
+game_winners.json
 
 # OS metadata
 .DS_Store

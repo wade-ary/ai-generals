@@ -69,7 +69,7 @@ ema_decay: 0.999
 num_envs: 512
 num_steps: 512
 truncation: 2048
-num_iters: 1000
+num_iters: 2000
 minibatch_size: 1024
 seed: 44
 num_epochs: 1
