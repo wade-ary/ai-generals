@@ -36,6 +36,7 @@ class ReplayGUI:
         show_tile_types: bool = False,
         mode: GuiMode = GuiMode.TRAIN,
         start_paused: bool = False,
+        speed_multiplier: float = 1.0,
     ):
         """
         Initialize the GUI.
@@ -66,7 +67,13 @@ class ReplayGUI:
             self.agent_ids[0]: {"color": colors[0]},
             self.agent_ids[1]: {"color": colors[1]},
         }
-        self._gui = FullGUI(self._adapter, agent_data, mode=mode, show_tile_types=show_tile_types)
+        self._gui = FullGUI(
+            self._adapter,
+            agent_data,
+            mode=mode,
+            show_tile_types=show_tile_types,
+            speed_multiplier=speed_multiplier,
+        )
         self._gui.properties.paused = start_paused
 
     @property
@@ -89,6 +96,10 @@ class ReplayGUI:
         use `play`, which drives the whole interactive loop.
         """
         return self._gui.tick(fps=fps or self.fps)
+
+    def render(self):
+        """Draw the current state without processing input or waiting."""
+        self._gui.render()
 
     def play(self, states, infos):
         """Run the interactive replay loop until the user quits (REPLAY mode).

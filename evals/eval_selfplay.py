@@ -4,6 +4,7 @@ Usage:
     python evals/eval_selfplay.py model.eqx --config configs/S.yaml
     python evals/eval_selfplay.py model_a.eqx model_b.eqx --config configs/S.yaml
     python evals/eval_selfplay.py model.eqx --config configs/S.yaml --headless --num-games 100
+    python evals/eval_selfplay.py model.eqx --config configs/S.yaml --gif replay.gif
 """
 
 import sys
@@ -43,7 +44,8 @@ def _make_eval_env(cfg):
                        num_cities_range=cities, castle_val_range=castle)
 
 
-def _play_one_game(state, env, pool, agent_p0, agent_p1, cfg, gui=None, fps=10):
+def _play_one_game(state, env, pool, agent_p0, agent_p1, cfg, gui=None, fps=10,
+                   frame_callback=None):
     """Play a single game, return (winner, steps, p0_passes, p1_passes, state, timestep)."""
     obs_state_p0 = agent_p0.init_obs_state_fn(cfg.pad_to, cfg.pad_to)
     obs_state_p1 = agent_p1.init_obs_state_fn(cfg.pad_to, cfg.pad_to)
@@ -72,12 +74,80 @@ def _play_one_game(state, env, pool, agent_p0, agent_p1, cfg, gui=None, fps=10):
 
         if gui is not None:
             gui.update(state)
-            gui.tick(fps=fps)
+            if frame_callback is not None:
+                gui.render()
+                frame_callback(step + 1)
+            else:
+                gui.tick(fps=fps)
 
         if timestep.terminated or timestep.truncated:
             return int(timestep.info.winner), step + 1, p0_passes, p1_passes, state, timestep
 
     return -1, cfg.truncation, p0_passes, p1_passes, state, timestep
+
+
+def record_selfplay_gif(agent_p0, agent_p1, cfg, output_path, fps=10, seed=123,
+                        frame_stride=4, game_index=0, playback_speed=2.0):
+    """Record one deterministic self-play game as a GitHub-friendly GIF."""
+    from pathlib import Path
+
+    import pygame
+    from PIL import Image
+
+    from generals.gui import ReplayGUI
+
+    env = _make_eval_env(cfg)
+    key = jrandom.PRNGKey(seed)
+    key, pool_key = jrandom.split(key)
+    pool, _ = env.reset(pool_key)
+    for _ in range(game_index + 1):
+        key, init_key = jrandom.split(key)
+    state = env.init_state(init_key)
+
+    names = [agent_p0.name or "Red (P0)", agent_p1.name or "Blue (P1)"]
+    gui = ReplayGUI(state, agent_ids=names, speed_multiplier=playback_speed)
+    frames = []
+
+    def capture(step):
+        if step % frame_stride != 0:
+            return
+        surface = pygame.display.get_surface()
+        frames.append(Image.frombytes(
+            "RGB", surface.get_size(), pygame.image.tobytes(surface, "RGB")
+        ))
+
+    gui.update(state)
+    gui.render()
+    capture(0)
+
+    winner, steps, _, _, final_state, timestep = _play_one_game(
+        state, env, pool, agent_p0, agent_p1, cfg, gui=gui, fps=None,
+        frame_callback=capture,
+    )
+    gui.update(timestep.last_state if timestep.terminated or timestep.truncated else final_state,
+               timestep.info)
+    gui.render()
+    surface = pygame.display.get_surface()
+    frames.append(Image.frombytes(
+        "RGB", surface.get_size(), pygame.image.tobytes(surface, "RGB")
+    ))
+    gui.close()
+
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    duration_ms = max(20, round(1000 * frame_stride / (max(1, fps) * playback_speed)))
+    durations = [duration_ms] * len(frames)
+    durations[-1] = 2000
+    frames[0].save(
+        destination,
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=0,
+        optimize=True,
+    )
+    label = "P0" if winner == 0 else "P1" if winner == 1 else "Draw"
+    print(f"Saved {destination} ({len(frames)} frames, {steps} turns, winner={label})")
 
 
 def run_selfplay_headless(agent_p0, agent_p1, cfg, num_games=100, seed=123):
@@ -167,6 +237,14 @@ def main():
     parser.add_argument("--truncation", type=int, default=None)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--num-games", type=int, default=100)
+    parser.add_argument("--gif", type=str, default=None,
+                        help="Record one self-play game to this GIF instead of opening the live GUI")
+    parser.add_argument("--gif-stride", type=int, default=4,
+                        help="Capture every Nth game turn (default: 4)")
+    parser.add_argument("--gif-game-index", type=int, default=0,
+                        help="Zero-based game from the deterministic seed sequence (default: 0)")
+    parser.add_argument("--gif-speed", type=float, default=2.0,
+                        help="GIF playback multiplier and displayed speed (default: 2.0)")
     args = parser.parse_args()
 
     agent_p0 = Agent.load(args.model_p0, args.config)
@@ -192,7 +270,12 @@ def main():
     if args.truncation is not None:
         cfg.truncation = args.truncation
 
-    if args.headless:
+    if args.gif:
+        record_selfplay_gif(agent_p0, agent_p1, cfg, args.gif, fps=args.fps,
+                            seed=args.seed, frame_stride=max(1, args.gif_stride),
+                            game_index=max(0, args.gif_game_index),
+                            playback_speed=max(0.1, args.gif_speed))
+    elif args.headless:
         run_selfplay_headless(agent_p0, agent_p1, cfg,
                               num_games=args.num_games, seed=args.seed)
     else:
