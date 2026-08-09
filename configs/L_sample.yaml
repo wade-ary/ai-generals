@@ -1,4 +1,4 @@
-run_name: L_7d_gae90
+run_name: L_sample
 
 # Map settings
 pad_to: 24
@@ -69,7 +69,7 @@ ema_decay: 0.999
 num_envs: 512
 num_steps: 512
 truncation: 2048
-num_iters: 100000
+num_iters: 1000
 minibatch_size: 1024
 seed: 44
 num_epochs: 1
@@ -110,23 +110,9 @@ eval_every: 25
 eval_every_after: 200
 eval_games: 256
 eval_ema_only: true
+final_stage_rolling_eval: true
 ckpt_every: 100
 save_every: 200
-
-# Reference ELO eval
-ref_eval_every: 200
-ref_eval_games: 512
-ref_eval_dir: checkpoints/references/L_final
-ref_eval_matrix: ''
-ref_eval_min_grid_size: 17
-ref_eval_max_grid_size: 23
-ref_eval_min_generals_distance: 17
-ref_eval_max_generals_distance: 40
-ref_eval_num_cities_min: 9
-ref_eval_num_cities_max: 12
-ref_eval_castle_val_min: 40
-ref_eval_castle_val_max: 51
-ref_eval_truncation: 2048
 
 # Checkpoints
 ckpt_pool_size: 0

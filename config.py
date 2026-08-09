@@ -104,6 +104,7 @@ class Config:
     eval_opponent: str = "random"  # "random", "checkpoint", or "rolling_checkpoint"
     eval_opponent_path: str = ""
     eval_opponent_config: str = ""
+    final_stage_rolling_eval: bool = False  # on final curriculum stage, eval vs latest saved checkpoint
     ckpt_every: int = 10
 
     # Reference ELO eval during training

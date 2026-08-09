@@ -400,6 +400,7 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
     print(f"Training ({mode_str}, {num_devices} device(s))...")
     train_start = time.time()
     pending_eval_opponent = None
+    last_saved_eval_opponent = None
     for it in range(cfg.num_iters):
         # Eval (before training so it==0 gives a baseline)
         network = _get_network()
@@ -461,6 +462,28 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
                 if stage.gamma is not None:
                     current_gamma = stage.gamma
                 print(f"CURRICULUM: regenerated pool")
+
+                # Final-stage rolling evaluation is deliberately separate from
+                # curriculum gating. Use the latest scheduled checkpoint as the
+                # first opponent, or snapshot the entry weights if no scheduled
+                # checkpoint has been saved yet.
+                if (cfg.final_stage_rolling_eval
+                        and current_stage_idx == len(curriculum_stages) - 1):
+                    if last_saved_eval_opponent is None:
+                        baseline_name = f"{run_name}_final_stage_baseline_{global_it}"
+                        baseline_path = os.path.join(ckpt_dir, f"{baseline_name}.eqx")
+                        eqx.tree_serialise_leaves(
+                            baseline_path, (network, _get_opt_state()))
+                        baseline_network, _ = eqx.tree_deserialise_leaves(
+                            baseline_path, (network, _get_opt_state()))
+                        last_saved_eval_opponent = Agent(
+                            baseline_network, cfg, bundle, name=baseline_name)
+                        print(f"  SAVED final-stage baseline: {baseline_path}")
+                    ev = ev._replace(
+                        eval_opponent_agent=last_saved_eval_opponent)
+                    print(
+                        "FINAL-STAGE EVAL OPPONENT: frozen "
+                        f"{last_saved_eval_opponent.name}")
 
         # Periodically regenerate the map pool for diversity (no recompile — pool is traced)
         if cfg.reset_pool_every > 0 and it > 0 and it % cfg.reset_pool_every == 0:
@@ -675,9 +698,15 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
             ema_latest = os.path.join(ckpt_dir, f"{run_name}_ema.eqx")
             eqx.tree_serialise_leaves(ema_latest, ema_network)
             print(f"  SAVED: {path} + EMA: {ema_path}")
-            if cfg.eval_opponent == "rolling_checkpoint":
-                pending_eval_opponent = Agent(
-                    network, cfg, bundle, name=f"{run_name}_{completed_it}")
+            saved_network, _ = eqx.tree_deserialise_leaves(
+                path, (network, _get_opt_state()))
+            saved_eval_opponent = Agent(
+                saved_network, cfg, bundle, name=f"{run_name}_{completed_it}")
+            last_saved_eval_opponent = saved_eval_opponent
+            if (cfg.eval_opponent == "rolling_checkpoint"
+                    or (cfg.final_stage_rolling_eval and curriculum_stages
+                        and current_stage_idx == len(curriculum_stages) - 1)):
+                pending_eval_opponent = saved_eval_opponent
 
         # Free large arrays to prevent BFC allocator fragmentation on next rollout
         del obs, masks, temporal, actions, lps, advs, rets, train_mask, batch, sample_idx
