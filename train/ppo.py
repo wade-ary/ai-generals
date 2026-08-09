@@ -347,7 +347,7 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
     ref_eval_env = None
     ref_eval_pool = None
     eval_opponent_agent = None
-    if cfg.eval_opponent == "checkpoint":
+    if cfg.eval_opponent in ("checkpoint", "rolling_checkpoint"):
         if not cfg.eval_opponent_path or not cfg.eval_opponent_config:
             raise ValueError(
                 "checkpoint evaluation requires eval_opponent_path and "
@@ -360,7 +360,8 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         print(f"EVAL OPPONENT: frozen {eval_opponent_agent.name}")
     elif cfg.eval_opponent != "random":
         raise ValueError(
-            f"Unknown eval_opponent '{cfg.eval_opponent}'; use random or checkpoint"
+            f"Unknown eval_opponent '{cfg.eval_opponent}'; use random, checkpoint, "
+            "or rolling_checkpoint"
         )
     if cfg.ref_eval_every > 0 and cfg.ref_eval_dir:
         import copy, json as _json
@@ -398,6 +399,7 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
     mode_str = "self-play"
     print(f"Training ({mode_str}, {num_devices} device(s))...")
     train_start = time.time()
+    pending_eval_opponent = None
     for it in range(cfg.num_iters):
         # Eval (before training so it==0 gives a baseline)
         network = _get_network()
@@ -407,6 +409,13 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         eval_ran, last_eval_wr, key = periodic_eval(
             global_it, cfg, eval_freq, network, ema_params, static,
             eval_env, eval_pool, ev, logger, key, last_eval_wr)
+
+        # A newly saved rolling checkpoint is promoted only after the current
+        # model has first been evaluated against the previous checkpoint.
+        if pending_eval_opponent is not None:
+            ev = ev._replace(eval_opponent_agent=pending_eval_opponent)
+            print(f"EVAL OPPONENT: promoted frozen {pending_eval_opponent.name}")
+            pending_eval_opponent = None
 
         t0 = time.time()
 
@@ -653,11 +662,11 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         network = _get_network()
 
         completed_it = global_it + 1
-        if completed_it % cfg.ckpt_every == 0:
+        if (it + 1) % cfg.ckpt_every == 0:
             ema_ckpt_path = os.path.join(ckpt_dir, f"{run_name}_ema_{completed_it}.eqx")
             eqx.tree_serialise_leaves(ema_ckpt_path, eqx.combine(ema_params, static))
 
-        if completed_it % cfg.save_every == 0:
+        if (it + 1) % cfg.save_every == 0:
             path = os.path.join(ckpt_dir, f"{run_name}_{completed_it}.eqx")
             eqx.tree_serialise_leaves(path, (network, _get_opt_state()))
             ema_network = eqx.combine(ema_params, static)
@@ -666,6 +675,9 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
             ema_latest = os.path.join(ckpt_dir, f"{run_name}_ema.eqx")
             eqx.tree_serialise_leaves(ema_latest, ema_network)
             print(f"  SAVED: {path} + EMA: {ema_path}")
+            if cfg.eval_opponent == "rolling_checkpoint":
+                pending_eval_opponent = Agent(
+                    network, cfg, bundle, name=f"{run_name}_{completed_it}")
 
         # Free large arrays to prevent BFC allocator fragmentation on next rollout
         del obs, masks, temporal, actions, lps, advs, rets, train_mask, batch, sample_idx

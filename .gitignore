@@ -5,14 +5,20 @@
 bc/data/
 bc/bc/checkpoints/
 bc/replays/
+bc_batch_*
 
 # Model weights / serialized data
+S/
+*.eqx
 *.pt
 *.pth
 *.npz
 *.pkl
 *.ckpt
 *.h5
+
+# OS metadata
+.DS_Store
 
 # Python
 __pycache__/

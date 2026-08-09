@@ -1,0 +1,86 @@
+# Continue from S_750 for 5,000 PPO iterations. Training remains current-policy
+# self-play; evaluation uses the most recent 500-iteration checkpoint as a
+# frozen rolling opponent. Reward is terminal win/loss only.
+
+run_name: S
+
+# Resume model, optimizer, EMA, and schedules from global iteration 750
+init_checkpoint: S/S_750/S_750.eqx
+ema_checkpoint: S/S_750/S_ema_750.eqx
+iteration_offset: 750
+
+# Final S environment
+pad_to: 12
+min_grid_size: 11
+max_grid_size: 12
+min_generals_distance: 11
+max_generals_distance: 17
+num_cities_min: 2
+num_cities_max: 4
+castle_val_min: 13
+castle_val_max: 18
+pool_size: 200000
+reset_pool_every: 10
+truncation: 1024
+curriculum:
+
+# Network -- exactly matches S_750
+network: history_transformer
+depth: 4
+embed_dim: 352
+n_head: 8
+ff_factor: 2
+patch_size: 2
+use_bf16: true
+
+# 5,000 additional PPO iterations (global 751-5750)
+num_envs: 1024
+num_steps: 256
+num_iters: 5000
+minibatch_size: 2048
+seed: 44
+
+# PPO with sparse terminal win/loss reward
+reward_fn: win_lose_reward
+num_epochs: 1
+gamma: 1.0
+gae_lambda: 0.9
+clip_eps: 0.2
+max_grad_norm: 0.267
+vf_coef: 0.5
+target_kl: 0.02
+adv_top_frac: 0.5
+
+# Continue schedules using iteration_offset
+ent_schedule: power_law
+ent_coef_start: 0.05
+ent_power: 0.2
+ent_coef_min: 0.001
+lr_schedule: power_law
+lr_power_law_numerator: 0.5
+lr_power_law_exponent: 1.1
+lr_power_law_min: 5e-6
+lr_power_law_max: 1e-4
+
+# Start against frozen S_750. After every 500 additional iterations, evaluate
+# against the prior checkpoint, save, then promote the new checkpoint.
+eval_every: 50
+eval_games: 512
+eval_opponent: rolling_checkpoint
+eval_opponent_path: S/S_750/S_750.eqx
+eval_opponent_config: S/S_750/config.yaml
+
+# Save after 500 additional iterations: S_1250, S_1750, ..., S_5750
+ckpt_every: 500
+save_every: 500
+
+# Separate reference ELO disabled
+ref_eval_every: 0
+ref_eval_dir: ""
+
+# Value head -- exactly matches S_750
+value_loss: ce
+num_bins: 128
+v_min: -1.0
+v_max: 1.0
+hl_sigma: 0.04
