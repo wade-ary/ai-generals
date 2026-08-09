@@ -19,32 +19,32 @@ reset_pool_every: 20
 curriculum:
   - min_generals_distance: 2
     max_generals_distance: 6
-    reward_fn: relative_progress_reward
+    reward_fn: win_lose_reward
 
   - win_rate_threshold: 0.6
     min_generals_distance: 4
     max_generals_distance: 8
-    reward_fn: relative_progress_reward
+    reward_fn: win_lose_reward
 
   - win_rate_threshold: 0.6
     min_generals_distance: 6
     max_generals_distance: 13
-    reward_fn: relative_progress_reward
+    reward_fn: win_lose_reward
 
   - win_rate_threshold: 0.6
     min_generals_distance: 11
     max_generals_distance: 17
-    reward_fn: relative_progress_reward
+    reward_fn: win_lose_reward
 
   - win_rate_threshold: 0.6
     min_generals_distance: 17
     max_generals_distance: 28
-    reward_fn: relative_progress_reward
+    reward_fn: win_lose_reward
 
   - win_rate_threshold: 0.6
     min_generals_distance: 17
     max_generals_distance: 42
-    reward_fn: relative_progress_reward
+    reward_fn: win_lose_reward
 
 # Network
 network: history_transformer
@@ -57,8 +57,8 @@ conv_dim: 256
 use_bf16: true
 
 # Reward / opponent
-reward_fn: relative_progress_reward
-initial_reward_fn: relative_progress_reward
+reward_fn: win_lose_reward
+initial_reward_fn: win_lose_reward
 opponent: self
 opponent_path: ''
 init_checkpoint: ''
