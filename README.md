@@ -4,4 +4,4 @@ A transformer-based reinforcement-learning agent for [Generals.io](https://gener
 Extension to: https://github.com/wade-ary/generals-ai
 Work in progress, but here are some test agents playing each other:
 
-![S_750 trained agent self-play](generals/assets/gifs/s750-selfplay.gif)
+![S_2250 versus S_1750 evaluation replay at 3x speed](generals/assets/gifs/s2250-vs-s1750.gif)

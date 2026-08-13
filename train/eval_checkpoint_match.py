@@ -203,6 +203,46 @@ def show_replay(states, infos, names, fps):
     gui.play(states, infos)
 
 
+def save_replay_gif(states, infos, names, output_path, fps, frame_stride, speed):
+    """Render a saved replay as a looping, GitHub-friendly GIF."""
+    from pathlib import Path
+
+    import pygame
+    from PIL import Image
+
+    from generals.gui import ReplayGUI
+
+    gui = ReplayGUI(states[0], agent_ids=names)
+    frames = []
+    selected = list(range(0, len(states), frame_stride))
+    if selected[-1] != len(states) - 1:
+        selected.append(len(states) - 1)
+
+    for frame_index in selected:
+        gui.update(states[frame_index], infos[frame_index])
+        gui.render()
+        surface = pygame.display.get_surface()
+        frames.append(Image.frombytes(
+            "RGB", surface.get_size(), pygame.image.tobytes(surface, "RGB")
+        ))
+    gui.close()
+
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    duration_ms = max(20, round(1000 * frame_stride / (max(1, fps) * speed)))
+    durations = [duration_ms] * len(frames)
+    durations[-1] = 2000
+    frames[0].save(
+        destination,
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=0,
+        optimize=True,
+    )
+    print(f"Saved GIF: {destination} ({len(frames)} frames, {speed:g}x speed)")
+
+
 def load_replay(path):
     with open(path, "rb") as file:
         replay = pickle.load(file)
@@ -236,6 +276,18 @@ def main():
     )
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument(
+        "--gif-output", default=None,
+        help="Render the replay to a GIF instead of opening the interactive viewer",
+    )
+    parser.add_argument(
+        "--gif-stride", type=int, default=1,
+        help="Include every Nth replay state in the GIF (default: 1)",
+    )
+    parser.add_argument(
+        "--gif-speed", type=float, default=1.0,
+        help="GIF playback speed multiplier (default: 1.0)",
+    )
+    parser.add_argument(
         "--view-replay", default=None,
         help="View a previously saved replay without running evaluation",
     )
@@ -251,6 +303,12 @@ def main():
             f"Replay: {metadata.get('winner_name', 'unknown winner')} | "
             f"Steps: {metadata.get('steps', len(states) - 1)}"
         )
+        if args.gif_output:
+            save_replay_gif(
+                states, infos, names, args.gif_output, args.fps,
+                max(1, args.gif_stride), max(0.1, args.gif_speed),
+            )
+            return
         show_replay(states, infos, names, args.fps)
         return
 
