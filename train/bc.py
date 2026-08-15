@@ -45,6 +45,8 @@ BC_VALUE_MAX = 1.0
 BC_VALUE_BINS = 128
 BC_HL_SIGMA = 0.04
 BC_TRAIN_FIELDS = ("obs", "action_mask", "temporal", "action", "reward")
+BC_SHARD_WORKERS = 2
+BC_STAGE_SLOTS = 4
 
 
 @dataclass(frozen=True)
@@ -302,6 +304,17 @@ def _stream_extract_shard(source: Path, destination: Path) -> StagedShard:
         extracted_bytes=extracted_bytes,
         extraction_seconds=time.perf_counter() - started,
     )
+
+
+def _estimated_staged_bytes(source: Path) -> int:
+    """Return the uncompressed size of the members needed for BC training."""
+
+    with zipfile.ZipFile(source) as archive:
+        members = {Path(info.filename).stem: info for info in archive.infolist()}
+        missing = set(BC_TRAIN_FIELDS) - set(members)
+        if missing:
+            raise ValueError(f"{source} is missing fields: {sorted(missing)}")
+        return sum(members[field].file_size for field in BC_TRAIN_FIELDS)
 
 
 def _open_staged_arrays(shard: StagedShard) -> dict[str, np.memmap]:
@@ -814,7 +827,11 @@ def train_bc(
         )
     else:
         print(f"GPU telemetry unavailable: {gpu_sampler.error}")
-    rng = np.random.default_rng(cfg.seed)
+    # Keep epoch ordering independent from the number of random draws used for
+    # in-shard batch shuffling. This lets us plan across epoch boundaries early
+    # enough to keep both extraction workers occupied.
+    order_rng = np.random.default_rng(cfg.seed)
+    batch_rng = np.random.default_rng(cfg.seed + 1)
     train_step = make_bc_train_step(
         optimizer,
         cfg.value_beta,
@@ -823,17 +840,66 @@ def train_bc(
     optimizer_step = 0
 
     try:
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="bc-shard") as pool:
-            epoch_shards = list(shards)
-            rng.shuffle(epoch_shards)
-            current_slot = 0
-            run_started = time.perf_counter()
-            current = _stream_extract_shard(
-                epoch_shards[0],
-                run_stage / f"slot-{current_slot}",
+        epoch_orders: list[list[Path]] = []
+        staged_sequence: list[Path] = []
+        for _epoch in range(cfg.max_epochs):
+            epoch_order = list(shards)
+            order_rng.shuffle(epoch_order)
+            epoch_orders.append(epoch_order)
+            staged_sequence.extend(epoch_order)
+
+        # Reserve enough local disk for the worst possible four-slot window.
+        # The source NPZ files are not counted because they already exist.
+        staged_sizes = [_estimated_staged_bytes(path) for path in shards]
+        # A shard may appear twice in a four-slot window at an epoch boundary,
+        # so four times the largest shard is the safe upper bound.
+        largest_window = BC_STAGE_SLOTS * max(staged_sizes)
+        required_bytes = int(largest_window * 1.05)
+        free_bytes = shutil.disk_usage(run_stage).free
+        if free_bytes < required_bytes:
+            raise OSError(
+                f"Insufficient space for {BC_STAGE_SLOTS} staging slots: "
+                f"free={_format_bytes(free_bytes)}, estimated required="
+                f"{_format_bytes(required_bytes)}"
             )
 
+        with ThreadPoolExecutor(
+            max_workers=BC_SHARD_WORKERS,
+            thread_name_prefix="bc-shard",
+        ) as pool:
+            pending: dict[int, tuple[int, Future[StagedShard]]] = {}
+            free_slots = list(range(BC_STAGE_SLOTS))
+            next_to_submit = 0
+            run_started = time.perf_counter()
+
+            def submit_one() -> None:
+                nonlocal next_to_submit
+                if next_to_submit >= len(staged_sequence) or not free_slots:
+                    return
+                slot = free_slots.pop(0)
+                source = staged_sequence[next_to_submit]
+                pending[next_to_submit] = (
+                    slot,
+                    pool.submit(
+                        _stream_extract_shard,
+                        source,
+                        run_stage / f"slot-{slot}",
+                    ),
+                )
+                next_to_submit += 1
+
+            # Start both CPU workers immediately. Once the first ordered shard
+            # is available, fill the other two slots while it trains.
+            for _ in range(BC_SHARD_WORKERS):
+                submit_one()
+            current_index = 0
+            current_slot, current_future = pending.pop(current_index)
+            current = current_future.result()
+            while free_slots and next_to_submit < len(staged_sequence):
+                submit_one()
+
             for epoch in range(1, cfg.max_epochs + 1):
+                epoch_shards = epoch_orders[epoch - 1]
                 epoch_started = (
                     run_started if epoch == 1 else time.perf_counter()
                 )
@@ -849,37 +915,7 @@ def train_bc(
                         "JAX/XLA compilation cost."
                     )
 
-                next_epoch_shards: list[Path] | None = None
                 for shard_index, _source in enumerate(epoch_shards):
-                    next_future: Future[StagedShard] | None = None
-                    next_source: Path | None = None
-                    if shard_index + 1 < len(epoch_shards):
-                        next_source = epoch_shards[shard_index + 1]
-                    elif epoch < cfg.max_epochs:
-                        # Decide the next epoch's order early enough to overlap
-                        # its first extraction with this epoch's final training.
-                        next_epoch_shards = list(shards)
-                        rng.shuffle(next_epoch_shards)
-                        next_source = next_epoch_shards[0]
-
-                    next_slot_index: int | None = None
-                    if next_source is not None:
-                        free_bytes = shutil.disk_usage(run_stage).free
-                        estimated_required = int(current.extracted_bytes * 1.1)
-                        if free_bytes < estimated_required:
-                            raise OSError(
-                                "Insufficient staging space for a second shard: "
-                                f"free={_format_bytes(free_bytes)}, estimated "
-                                f"required={_format_bytes(estimated_required)}"
-                            )
-                        next_slot_index = 1 - current_slot
-                        next_slot = run_stage / f"slot-{next_slot_index}"
-                        next_future = pool.submit(
-                            _stream_extract_shard,
-                            next_source,
-                            next_slot,
-                        )
-
                     gpu_sampler.start()
                     try:
                         network, opt_state, ema_network, optimizer_step, metrics = (
@@ -888,7 +924,7 @@ def train_bc(
                                 epoch=epoch,
                                 shard_number=shard_index + 1,
                                 shard_total=len(epoch_shards),
-                                rng=rng,
+                                rng=batch_rng,
                                 network=network,
                                 opt_state=opt_state,
                                 ema_network=ema_network,
@@ -904,12 +940,14 @@ def train_bc(
                     epoch_batches += int(metrics["batches"])
                     epoch_trained_samples += int(metrics["trained_samples"])
                     shutil.rmtree(current.directory)
-                    if next_future is not None:
+                    free_slots.append(current_slot)
+                    submit_one()
+
+                    current_index += 1
+                    if current_index < len(staged_sequence):
                         wait_started = time.perf_counter()
-                        current = next_future.result()
-                        if next_slot_index is None:
-                            raise AssertionError("next staging slot was not set")
-                        current_slot = next_slot_index
+                        current_slot, current_future = pending.pop(current_index)
+                        current = current_future.result()
                         metrics["shard_exposed_wait_seconds"] = (
                             time.perf_counter() - wait_started
                         )
@@ -947,8 +985,6 @@ def train_bc(
                     _save_checkpoints(
                         cfg, epoch, network, opt_state, ema_network
                     )
-                if next_epoch_shards is not None:
-                    epoch_shards = next_epoch_shards
     finally:
         shutil.rmtree(run_stage, ignore_errors=True)
         atexit.unregister(shutil.rmtree)
@@ -1034,7 +1070,8 @@ def main() -> None:
     print(
         f"minibatch={cfg.minibatch_size:,} bf16={model_cfg.use_bf16} "
         f"grad_clip={model_cfg.max_grad_norm} ema={cfg.ema_decay} "
-        "host_buffers=2 device_buffers=2"
+        f"host_buffers=2 device_buffers=2 shard_workers={BC_SHARD_WORKERS} "
+        f"staging_slots={BC_STAGE_SLOTS}"
     )
     print(
         f"learning_rate=cosine max={cfg.initial_lr:.1e} "
