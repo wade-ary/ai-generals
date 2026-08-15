@@ -11,3 +11,4 @@ optax
 jaxtyping
 ruamel.yaml
 wandb
+nvidia-ml-py>=12.0.0

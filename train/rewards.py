@@ -36,6 +36,7 @@ def relative_progress_reward(
     army_weight=0.30,
     land_weight=0.30,
     castle_weight=0.40,
+    terminal_reward_scale=1.0,
     max_army_ratio=2.0,
     max_land_ratio=2.0,
     max_castle_ratio=2.0,
@@ -45,7 +46,8 @@ def relative_progress_reward(
     Each metric's potential is log(mine / opponent), normalized
     by log(max_ratio) and clipped to [-1, 1]. The shaping reward is the change
     in that potential from ``prior_obs`` to ``next_obs``. On a terminal step,
-    the original +/-1 win/loss reward is returned instead of shaping.
+    ``terminal_reward_scale`` times the +/-1 win/loss reward is returned instead
+    of shaping.
     """
     del action, gamma  # Kept for the common rollout reward interface.
 
@@ -86,7 +88,9 @@ def relative_progress_reward(
         + land_weight * land_reward
         + castle_weight * castle_reward
     )
-    terminal = win_lose_reward(prior_obs, None, next_obs, winners, truncated=truncated)
+    terminal = terminal_reward_scale * win_lose_reward(
+        prior_obs, None, next_obs, winners, truncated=truncated
+    )
     return jnp.where(winners >= 0, terminal, shaping)
 
 
@@ -97,6 +101,7 @@ def get_reward_fn(cfg):
     if cfg.reward_fn == "relative_progress_reward":
         return partial(
             relative_progress_reward,
+            terminal_reward_scale=cfg.terminal_reward_scale,
             max_army_ratio=cfg.max_army_ratio,
             max_land_ratio=cfg.max_land_ratio,
             max_castle_ratio=cfg.max_castle_ratio,

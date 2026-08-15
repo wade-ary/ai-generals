@@ -3,6 +3,9 @@
 
 # BC training data & artifacts
 bc/data/
+data/bc_data/
+data/bc_data_with_winners/
+data/bc_test_10/
 bc/bc/checkpoints/
 bc/replays/
 bc_batch_*
@@ -26,3 +29,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .ipynb_checkpoints/
+
+# Local development decision log
+important_descions.readme
+
+# Local scratch and extracted reference artifacts
+tmp/

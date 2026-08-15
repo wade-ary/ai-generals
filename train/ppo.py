@@ -497,12 +497,17 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
             current_gamma = cfg.gamma + (cfg.gamma_end - cfg.gamma) * frac
 
         # Collect rollout — pmapped across devices
-        t_rollout = time.time()
+        t_rollout = time.perf_counter()
         gamma_rep = jnp.full(num_devices, current_gamma)
         states, rollout_data, keys, obs_state_p0, obs_state_p1 = p_rollout_self(
             params, states, keys, obs_state_p0, obs_state_p1, pool_rep, gamma_rep)
         jax.block_until_ready(states)
-        t_rollout = time.time() - t_rollout
+        t_rollout = time.perf_counter() - t_rollout
+        print(
+            f"[TIMING] Rollout {global_it + 1}: "
+            f"simulation={t_rollout:.3f}s",
+            flush=True,
+        )
 
         # rollout_data shapes: (D, num_steps, N, ...) where N = 2*num_envs (self) or num_envs
         obs, masks, temporal, actions, lps, vals, next_vals, rews, terminated, truncated, winners, owned_cities = rollout_data
@@ -544,7 +549,7 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
             mc_value_bias = float('nan')
 
         # PPO update (minibatched, lax.scan over gradient steps)
-        t_ppo = time.time()
+        t_ppo = time.perf_counter()
         train_mask = 1.0 - truncated.astype(jnp.float32)
 
         # Compute sample indices (no data copies — just indices)
@@ -587,7 +592,12 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
             if cfg.target_kl is not None and float(metrics["approx_kl"][0]) > cfg.target_kl:
                 break
         jax.block_until_ready(params)
-        t_ppo = time.time() - t_ppo
+        t_ppo = time.perf_counter() - t_ppo
+        print(
+            f"[TIMING] Rollout {global_it + 1}: "
+            f"training={t_ppo:.3f}s",
+            flush=True,
+        )
 
         # Metrics from device 0 (identical across devices due to pmean)
         m = jax.tree.map(lambda x: x[0], metrics)
@@ -658,6 +668,8 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
             "train/draw_rate": dr,
             "train/mean_owned_cities": mean_owned_cities,
             "train/sps": sps,
+            "timing/simulation_seconds": t_rollout,
+            "timing/training_seconds": t_ppo,
             "train/ent_coef": current_ent_coef,
             "train/lr": current_lr,
             "train/gamma": current_gamma,

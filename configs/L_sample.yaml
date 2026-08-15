@@ -1,4 +1,4 @@
-run_name: L_sample
+run_name: L_sample_from_800
 
 # Map settings
 pad_to: 24
@@ -57,22 +57,24 @@ conv_dim: 256
 use_bf16: true
 
 # Reward / opponent
-reward_fn: win_lose_reward
+reward_fn: relative_progress_reward
+terminal_reward_scale: 10.0
 initial_reward_fn: win_lose_reward
 opponent: self
 opponent_path: ''
-init_checkpoint: ''
-ema_checkpoint: ''
+init_checkpoint: checkpoints/L_sample/L_sample_800.eqx
+ema_checkpoint: checkpoints/L_sample/L_sample_ema_800.eqx
 ema_decay: 0.999
 
 # Rollout
 num_envs: 512
 num_steps: 512
 truncation: 2048
-num_iters: 2000
+num_iters: 1200
 minibatch_size: 1024
 seed: 44
 num_epochs: 1
+iteration_offset: 800
 
 # PPO
 gamma: 1.0
@@ -127,9 +129,9 @@ best_cp_proportion: 0.75
 # Value loss
 value_loss: ce
 num_bins: 128
-v_min: -1.0
-v_max: 1.0
-hl_sigma: 0.04
+v_min: -10.0
+v_max: 10.0
+hl_sigma: 0.2
 
 magnet_policy: expander
 

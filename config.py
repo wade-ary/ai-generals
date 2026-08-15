@@ -58,6 +58,7 @@ class Config:
 
     # Reward
     reward_fn: str = "win_lose_reward"
+    terminal_reward_scale: float = 1.0
     max_army_ratio: float = 2.0
     max_land_ratio: float = 2.0
     max_castle_ratio: float = 2.0
