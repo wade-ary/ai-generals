@@ -6,19 +6,15 @@ observations are 24x24, so only the spatial input/action dimensions differ
 from the original 12x12 S checkpoints.
 
 The remaining training pipeline is layered on top of the initialization in
-this file: double-buffered shard streaming, one-pass shard updates, EMA,
-epoch evaluation, and checkpointing.
+this file: four-shard in-memory streaming, one-pass shard updates, EMA, epoch
+evaluation, and checkpointing.
 """
 
 from __future__ import annotations
 
 import argparse
-import atexit
 import json
-import os
-import shutil
 import time
-import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -46,7 +42,7 @@ BC_VALUE_BINS = 128
 BC_HL_SIGMA = 0.04
 BC_TRAIN_FIELDS = ("obs", "action_mask", "temporal", "action", "reward")
 BC_SHARD_WORKERS = 2
-BC_STAGE_SLOTS = 4
+BC_RAM_SLOTS = 4
 
 
 @dataclass(frozen=True)
@@ -55,7 +51,6 @@ class BCTrainConfig:
 
     model_config: Path = Path("configs/S.yaml")
     data_dir: Path = Path("data")
-    stage_dir: Path = Path("/content/bc_stage")
     checkpoint_dir: Path = Path(
         "/content/drive/MyDrive/generals_bc/checkpoints"
     )
@@ -140,20 +135,30 @@ def _cosine_learning_rate(step: int, maximum: float, schedule_steps: int) -> flo
 
 
 @dataclass(frozen=True)
-class StagedShard:
-    """One atomically extracted shard ready for memory-mapped consumption."""
+class LoadedShard:
+    """One replay shard fully decompressed into CPU-resident NumPy arrays."""
 
     source: Path
-    directory: Path
+    arrays: Mapping[str, np.ndarray]
     sample_count: int
     compressed_bytes: int
-    extracted_bytes: int
-    extraction_seconds: float
+    resident_bytes: int
+    load_seconds: float
+
+
+@dataclass(frozen=True)
+class ShardPlan:
+    """The ordered epoch position associated with one source shard."""
+
+    epoch: int
+    shard_number: int
+    shards_in_epoch: int
+    source: Path
 
 
 @dataclass(frozen=True)
 class PreparedBatch:
-    """Host-resident batch plus the time spent reading it from mmap files."""
+    """Contiguous host batch plus the time spent gathering it from RAM."""
 
     arrays: tuple[np.ndarray, ...]
     preparation_seconds: float
@@ -161,7 +166,7 @@ class PreparedBatch:
 
 @dataclass(frozen=True)
 class BatchSpec:
-    """One contiguous mmap read block and its in-batch shuffle order."""
+    """One contiguous source block and its in-batch shuffle order."""
 
     start: int
     permutation: np.ndarray
@@ -254,74 +259,34 @@ def _format_bytes(value: int | float) -> str:
     return f"{size:.1f}{units[-1]}"
 
 
-def _stream_extract_shard(source: Path, destination: Path) -> StagedShard:
-    """Stream selected NPY members from NPZ without materializing them in RAM."""
+def _load_shard_to_ram(source: Path) -> LoadedShard:
+    """Decompress the five training members of an NPZ directly into CPU RAM."""
 
     started = time.perf_counter()
-    temporary = destination.with_name(f"{destination.name}.partial")
-    if temporary.exists():
-        shutil.rmtree(temporary)
-    temporary.mkdir(parents=True)
-
-    try:
-        with zipfile.ZipFile(source) as archive:
-            members = {Path(name).stem: name for name in archive.namelist()}
-            missing = set(BC_TRAIN_FIELDS) - set(members)
-            if missing:
-                raise ValueError(f"{source} is missing fields: {sorted(missing)}")
-
-            for field in BC_TRAIN_FIELDS:
-                output = temporary / f"{field}.npy"
-                with archive.open(members[field]) as reader, output.open("wb") as writer:
-                    shutil.copyfileobj(reader, writer, length=16 * 1024 * 1024)
-
-        arrays = {
-            field: np.load(temporary / f"{field}.npy", mmap_mode="r")
-            for field in BC_TRAIN_FIELDS
-        }
-        sample_count = int(arrays["action"].shape[0])
-        for field, array in arrays.items():
-            if array.shape[0] != sample_count:
-                raise ValueError(
-                    f"{source}: {field} has {array.shape[0]} samples, "
-                    f"expected {sample_count}"
-                )
-        del arrays
-
-        if destination.exists():
-            shutil.rmtree(destination)
-        os.replace(temporary, destination)
-    except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
-
-    extracted_bytes = sum(path.stat().st_size for path in destination.glob("*.npy"))
-    return StagedShard(
-        source=source,
-        directory=destination,
-        sample_count=sample_count,
-        compressed_bytes=source.stat().st_size,
-        extracted_bytes=extracted_bytes,
-        extraction_seconds=time.perf_counter() - started,
-    )
-
-
-def _estimated_staged_bytes(source: Path) -> int:
-    """Return the uncompressed size of the members needed for BC training."""
-
-    with zipfile.ZipFile(source) as archive:
-        members = {Path(info.filename).stem: info for info in archive.infolist()}
-        missing = set(BC_TRAIN_FIELDS) - set(members)
+    with np.load(source, allow_pickle=False) as archive:
+        missing = set(BC_TRAIN_FIELDS) - set(archive.files)
         if missing:
             raise ValueError(f"{source} is missing fields: {sorted(missing)}")
-        return sum(members[field].file_size for field in BC_TRAIN_FIELDS)
+        arrays = {field: archive[field] for field in BC_TRAIN_FIELDS}
 
+    sample_count = int(arrays["action"].shape[0])
+    for field, array in arrays.items():
+        if array.shape[0] != sample_count:
+            raise ValueError(
+                f"{source}: {field} has {array.shape[0]} samples, "
+                f"expected {sample_count}"
+            )
+        if not array.flags.c_contiguous:
+            arrays[field] = np.ascontiguousarray(array)
 
-def _open_staged_arrays(shard: StagedShard) -> dict[str, np.memmap]:
-    return {
-        field: np.load(shard.directory / f"{field}.npy", mmap_mode="r")
-        for field in BC_TRAIN_FIELDS
-    }
+    return LoadedShard(
+        source=source,
+        arrays=arrays,
+        sample_count=sample_count,
+        compressed_bytes=source.stat().st_size,
+        resident_bytes=sum(array.nbytes for array in arrays.values()),
+        load_seconds=time.perf_counter() - started,
+    )
 
 
 def _shuffled_batch_specs(
@@ -329,7 +294,7 @@ def _shuffled_batch_specs(
     minibatch_size: int,
     rng: np.random.Generator,
 ) -> list[BatchSpec]:
-    """Shuffle sample order while retaining large, mmap-friendly read blocks."""
+    """Shuffle block order and sample order within each contiguous RAM block."""
 
     usable = sample_count - sample_count % minibatch_size
     starts = np.arange(0, usable, minibatch_size, dtype=np.int64)
@@ -344,9 +309,9 @@ def _shuffled_batch_specs(
 
 
 def _prepare_host_batch(
-    arrays: Mapping[str, np.memmap], spec: BatchSpec
+    arrays: Mapping[str, np.ndarray], spec: BatchSpec
 ) -> PreparedBatch:
-    """Read one shuffled block efficiently and return contiguous host arrays."""
+    """Gather one shuffled block from RAM into contiguous host arrays."""
 
     started = time.perf_counter()
     stop = spec.start + len(spec.permutation)
@@ -582,9 +547,9 @@ def _save_checkpoints(
     print(f"Saved checkpoint: {model_path}")
 
 
-def _train_staged_shard(
+def _train_loaded_shard(
     *,
-    shard: StagedShard,
+    shard: LoadedShard,
     epoch: int,
     shard_number: int,
     shard_total: int,
@@ -597,9 +562,9 @@ def _train_staged_shard(
     device: Any,
     optimizer_step: int,
 ) -> tuple[Any, optax.OptState, Any, int, dict[str, Any]]:
-    """Train one mmap-backed shard with one asynchronously prepared batch."""
+    """Train one RAM-resident shard with double-buffered host/device batches."""
 
-    arrays = _open_staged_arrays(shard)
+    arrays = shard.arrays
     batch_specs = _shuffled_batch_specs(
         shard.sample_count, cfg.minibatch_size, rng
     )
@@ -736,11 +701,12 @@ def _train_staged_shard(
         "optimizer_step_end": optimizer_step,
         "learning_rate_start": first_learning_rate,
         "learning_rate_end": last_learning_rate,
-        "shard_decompression_seconds": shard.extraction_seconds,
+        "shard_load_to_ram_seconds": shard.load_seconds,
+        "shard_resident_bytes": shard.resident_bytes,
         "training_seconds": elapsed,
         "samples_per_second": trained_samples / max(elapsed, 1e-9),
         "batch_training_ms": 1_000.0 * batch_training_seconds / len(batch_specs),
-        "disk_to_cpu_ms": 1_000.0 * prep_seconds / len(batch_specs),
+        "ram_batch_prepare_ms": 1_000.0 * prep_seconds / len(batch_specs),
         "cpu_to_gpu_ms": 1_000.0 * device_transfer_seconds / len(batch_specs),
         "batch_data_exposed_ms": (
             1_000.0 * batch_data_exposed_seconds / len(batch_specs)
@@ -782,15 +748,16 @@ def _print_shard_metrics(metrics: Mapping[str, Any]) -> None:
         "  PIPELINE | "
         f"{gpu_summary} | batch avg: "
         f"train={metrics['batch_training_ms']:.1f}ms "
-        f"disk->cpu={metrics['disk_to_cpu_ms']:.1f}ms "
+        f"ram->batch={metrics['ram_batch_prepare_ms']:.1f}ms "
         f"cpu->gpu={metrics['cpu_to_gpu_ms']:.1f}ms "
         f"data-stall={metrics['batch_data_exposed_ms']:.1f}ms | "
-        f"shard: decompress={metrics['shard_decompression_seconds']:.1f}s "
+        f"shard: load->ram={metrics['shard_load_to_ram_seconds']:.1f}s "
+        f"resident={_format_bytes(metrics['shard_resident_bytes'])} "
         f"exposed={metrics['shard_exposed_wait_seconds']:.2f}s"
     )
     warnings = []
     if metrics["shard_exposed_wait_seconds"] > 0.05:
-        warnings.append("next-shard decompression did not finish before training")
+        warnings.append("next in-memory shard pair was not ready after training")
     if metrics["batch_data_exposed_ms"] > 1.0:
         warnings.append("next-batch data was not fully ready when training ended")
     if metrics.get("gpu_idle_sample_fraction", 0.0) > 0.05:
@@ -813,10 +780,11 @@ def train_bc(
         raise NotImplementedError(
             "The first BC streaming implementation currently supports one JAX device"
         )
+    if BC_RAM_SLOTS != 2 * BC_SHARD_WORKERS:
+        raise AssertionError(
+            "RAM pipeline requires one resident pair and one loading pair"
+        )
 
-    run_stage = cfg.stage_dir / f"bc-stage-{os.getpid()}"
-    run_stage.mkdir(parents=True, exist_ok=False)
-    atexit.register(shutil.rmtree, run_stage, True)
     device = jax.devices()[0]
     gpu_sampler = GPUUtilizationSampler(device_index=getattr(device, "id", 0))
     if gpu_sampler.available:
@@ -829,7 +797,7 @@ def train_bc(
         print(f"GPU telemetry unavailable: {gpu_sampler.error}")
     # Keep epoch ordering independent from the number of random draws used for
     # in-shard batch shuffling. This lets us plan across epoch boundaries early
-    # enough to keep both extraction workers occupied.
+    # enough to keep both RAM-loading workers occupied.
     order_rng = np.random.default_rng(cfg.seed)
     batch_rng = np.random.default_rng(cfg.seed + 1)
     train_step = make_bc_train_step(
@@ -839,155 +807,145 @@ def train_bc(
     )
     optimizer_step = 0
 
-    try:
-        epoch_orders: list[list[Path]] = []
-        staged_sequence: list[Path] = []
-        for _epoch in range(cfg.max_epochs):
-            epoch_order = list(shards)
-            order_rng.shuffle(epoch_order)
-            epoch_orders.append(epoch_order)
-            staged_sequence.extend(epoch_order)
+    epoch_orders: list[list[Path]] = []
+    plans: list[ShardPlan] = []
+    for epoch in range(1, cfg.max_epochs + 1):
+        epoch_order = list(shards)
+        order_rng.shuffle(epoch_order)
+        epoch_orders.append(epoch_order)
+        plans.extend(
+            ShardPlan(epoch, index, len(epoch_order), source)
+            for index, source in enumerate(epoch_order, start=1)
+        )
 
-        # Reserve enough local disk for the worst possible four-slot window.
-        # The source NPZ files are not counted because they already exist.
-        staged_sizes = [_estimated_staged_bytes(path) for path in shards]
-        # A shard may appear twice in a four-slot window at an epoch boundary,
-        # so four times the largest shard is the safe upper bound.
-        largest_window = BC_STAGE_SLOTS * max(staged_sizes)
-        required_bytes = int(largest_window * 1.05)
-        free_bytes = shutil.disk_usage(run_stage).free
-        if free_bytes < required_bytes:
-            raise OSError(
-                f"Insufficient space for {BC_STAGE_SLOTS} staging slots: "
-                f"free={_format_bytes(free_bytes)}, estimated required="
-                f"{_format_bytes(required_bytes)}"
+    plan_pairs = [
+        plans[index : index + BC_SHARD_WORKERS]
+        for index in range(0, len(plans), BC_SHARD_WORKERS)
+    ]
+    epoch_started = 0.0
+    epoch_batches = 0
+    epoch_trained_samples = 0
+    run_started = time.perf_counter()
+
+    def submit_pair(
+        pool: ThreadPoolExecutor, pair: list[ShardPlan]
+    ) -> list[Future[LoadedShard]]:
+        return [pool.submit(_load_shard_to_ram, plan.source) for plan in pair]
+
+    with ThreadPoolExecutor(
+        max_workers=BC_SHARD_WORKERS,
+        thread_name_prefix="bc-shard-ram",
+    ) as pool:
+        # Only the first pair is loaded synchronously. Every later pair loads
+        # while the GPU consumes the preceding two RAM-resident shards.
+        current_pair: list[LoadedShard | None] = [
+            future.result() for future in submit_pair(pool, plan_pairs[0])
+        ]
+
+        for pair_index, pair_plans in enumerate(plan_pairs):
+            next_futures = (
+                submit_pair(pool, plan_pairs[pair_index + 1])
+                if pair_index + 1 < len(plan_pairs)
+                else []
             )
+            next_pair: list[LoadedShard] = []
 
-        with ThreadPoolExecutor(
-            max_workers=BC_SHARD_WORKERS,
-            thread_name_prefix="bc-shard",
-        ) as pool:
-            pending: dict[int, tuple[int, Future[StagedShard]]] = {}
-            free_slots = list(range(BC_STAGE_SLOTS))
-            next_to_submit = 0
-            run_started = time.perf_counter()
-
-            def submit_one() -> None:
-                nonlocal next_to_submit
-                if next_to_submit >= len(staged_sequence) or not free_slots:
-                    return
-                slot = free_slots.pop(0)
-                source = staged_sequence[next_to_submit]
-                pending[next_to_submit] = (
-                    slot,
-                    pool.submit(
-                        _stream_extract_shard,
-                        source,
-                        run_stage / f"slot-{slot}",
-                    ),
-                )
-                next_to_submit += 1
-
-            # Start both CPU workers immediately. Once the first ordered shard
-            # is available, fill the other two slots while it trains.
-            for _ in range(BC_SHARD_WORKERS):
-                submit_one()
-            current_index = 0
-            current_slot, current_future = pending.pop(current_index)
-            current = current_future.result()
-            while free_slots and next_to_submit < len(staged_sequence):
-                submit_one()
-
-            for epoch in range(1, cfg.max_epochs + 1):
-                epoch_shards = epoch_orders[epoch - 1]
-                epoch_started = (
-                    run_started if epoch == 1 else time.perf_counter()
-                )
-                epoch_batches = 0
-                epoch_trained_samples = 0
-                print(
-                    f"\nEpoch {epoch}/{cfg.max_epochs}: "
-                    f"{len(epoch_shards)} shards, order shuffled"
-                )
-                if epoch == 1:
+            for pair_offset, plan in enumerate(pair_plans):
+                current = current_pair[pair_offset]
+                if current is None:
+                    raise AssertionError("RAM shard slot was released before training")
+                if plan.shard_number == 1:
+                    epoch_started = (
+                        run_started if plan.epoch == 1 else time.perf_counter()
+                    )
+                    epoch_batches = 0
+                    epoch_trained_samples = 0
                     print(
-                        "  Note: first-shard training time includes the one-time "
-                        "JAX/XLA compilation cost."
+                        f"\nEpoch {plan.epoch}/{cfg.max_epochs}: "
+                        f"{plan.shards_in_epoch} shards, order shuffled"
                     )
-
-                for shard_index, _source in enumerate(epoch_shards):
-                    gpu_sampler.start()
-                    try:
-                        network, opt_state, ema_network, optimizer_step, metrics = (
-                            _train_staged_shard(
-                                shard=current,
-                                epoch=epoch,
-                                shard_number=shard_index + 1,
-                                shard_total=len(epoch_shards),
-                                rng=batch_rng,
-                                network=network,
-                                opt_state=opt_state,
-                                ema_network=ema_network,
-                                train_step=train_step,
-                                cfg=cfg,
-                                device=device,
-                                optimizer_step=optimizer_step,
-                            )
+                    if plan.epoch == 1:
+                        print(
+                            "  Note: startup includes the first two RAM loads; "
+                            "first-shard training includes one-time JAX/XLA "
+                            "compilation."
                         )
-                    finally:
-                        gpu_metrics = gpu_sampler.stop()
-                    metrics.update(gpu_metrics)
-                    epoch_batches += int(metrics["batches"])
-                    epoch_trained_samples += int(metrics["trained_samples"])
-                    shutil.rmtree(current.directory)
-                    free_slots.append(current_slot)
-                    submit_one()
 
-                    current_index += 1
-                    if current_index < len(staged_sequence):
-                        wait_started = time.perf_counter()
-                        current_slot, current_future = pending.pop(current_index)
-                        current = current_future.result()
-                        metrics["shard_exposed_wait_seconds"] = (
-                            time.perf_counter() - wait_started
+                gpu_sampler.start()
+                try:
+                    network, opt_state, ema_network, optimizer_step, metrics = (
+                        _train_loaded_shard(
+                            shard=current,
+                            epoch=plan.epoch,
+                            shard_number=plan.shard_number,
+                            shard_total=plan.shards_in_epoch,
+                            rng=batch_rng,
+                            network=network,
+                            opt_state=opt_state,
+                            ema_network=ema_network,
+                            train_step=train_step,
+                            cfg=cfg,
+                            device=device,
+                            optimizer_step=optimizer_step,
                         )
-                    else:
-                        metrics["shard_exposed_wait_seconds"] = 0.0
-                    _append_metrics(cfg.metrics_path, metrics)
-                    _print_shard_metrics(metrics)
+                    )
+                finally:
+                    gpu_metrics = gpu_sampler.stop()
+                metrics.update(gpu_metrics)
+                epoch_batches += int(metrics["batches"])
+                epoch_trained_samples += int(metrics["trained_samples"])
 
-                epoch_seconds = time.perf_counter() - epoch_started
-                epoch_metrics = {
-                    "type": "epoch",
-                    "epoch": epoch,
-                    "shard_order": [path.name for path in epoch_shards],
-                    "minibatches": epoch_batches,
-                    "trained_samples": epoch_trained_samples,
-                    "epoch_seconds": epoch_seconds,
-                    "samples_per_second": (
-                        epoch_trained_samples / max(epoch_seconds, 1e-9)
-                    ),
-                }
-                _append_metrics(cfg.metrics_path, epoch_metrics)
-                print(
-                    f"Epoch {epoch} complete | minibatches={epoch_batches:,} "
-                    f"samples={epoch_trained_samples:,} | "
-                    f"time={epoch_seconds / 60.0:.1f}m "
-                    f"@ {epoch_metrics['samples_per_second']:.0f} samples/s"
-                )
-                if (
-                    not cfg.skip_checkpoints
-                    and (
-                        epoch % cfg.checkpoint_every == 0
-                        or epoch == cfg.max_epochs
+                # Drop the trained shard immediately. At the end of each pair,
+                # wait until both following shards are resident before rotating.
+                current_pair[pair_offset] = None
+                del current
+                if pair_offset + 1 == len(pair_plans) and next_futures:
+                    wait_started = time.perf_counter()
+                    next_pair = [future.result() for future in next_futures]
+                    metrics["shard_exposed_wait_seconds"] = (
+                        time.perf_counter() - wait_started
                     )
-                ):
-                    _save_checkpoints(
-                        cfg, epoch, network, opt_state, ema_network
+                else:
+                    metrics["shard_exposed_wait_seconds"] = 0.0
+
+                _append_metrics(cfg.metrics_path, metrics)
+                _print_shard_metrics(metrics)
+
+                if plan.shard_number == plan.shards_in_epoch:
+                    epoch_seconds = time.perf_counter() - epoch_started
+                    epoch_metrics = {
+                        "type": "epoch",
+                        "epoch": plan.epoch,
+                        "shard_order": [
+                            path.name for path in epoch_orders[plan.epoch - 1]
+                        ],
+                        "minibatches": epoch_batches,
+                        "trained_samples": epoch_trained_samples,
+                        "epoch_seconds": epoch_seconds,
+                        "samples_per_second": (
+                            epoch_trained_samples / max(epoch_seconds, 1e-9)
+                        ),
+                    }
+                    _append_metrics(cfg.metrics_path, epoch_metrics)
+                    print(
+                        f"Epoch {plan.epoch} complete | "
+                        f"minibatches={epoch_batches:,} "
+                        f"samples={epoch_trained_samples:,} | "
+                        f"time={epoch_seconds / 60.0:.1f}m "
+                        f"@ {epoch_metrics['samples_per_second']:.0f} samples/s"
                     )
-    finally:
-        shutil.rmtree(run_stage, ignore_errors=True)
-        atexit.unregister(shutil.rmtree)
+                    if (
+                        not cfg.skip_checkpoints
+                        and (
+                            plan.epoch % cfg.checkpoint_every == 0
+                            or plan.epoch == cfg.max_epochs
+                        )
+                    ):
+                        _save_checkpoints(
+                            cfg, plan.epoch, network, opt_state, ema_network
+                        )
+
+            current_pair = list(next_pair)
 
     return network, opt_state, ema_network
 
@@ -1000,7 +958,6 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("data"),
     )
-    parser.add_argument("--stage-dir", type=Path, default=Path("/content/bc_stage"))
     parser.add_argument(
         "--checkpoint-dir",
         type=Path,
@@ -1033,7 +990,6 @@ def main() -> None:
     cfg = BCTrainConfig(
         model_config=args.config,
         data_dir=args.data_dir,
-        stage_dir=args.stage_dir,
         checkpoint_dir=args.checkpoint_dir,
         metrics_path=args.metrics_path,
         seed=args.seed,
@@ -1071,7 +1027,7 @@ def main() -> None:
         f"minibatch={cfg.minibatch_size:,} bf16={model_cfg.use_bf16} "
         f"grad_clip={model_cfg.max_grad_norm} ema={cfg.ema_decay} "
         f"host_buffers=2 device_buffers=2 shard_workers={BC_SHARD_WORKERS} "
-        f"staging_slots={BC_STAGE_SLOTS}"
+        f"ram_shard_slots={BC_RAM_SLOTS}"
     )
     print(
         f"learning_rate=cosine max={cfg.initial_lr:.1e} "
