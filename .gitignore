@@ -5,6 +5,7 @@
 bc/data/
 data/bc_data/
 data/bc_data_with_winners/
+data/bc_small_shards/
 data/bc_test_10/
 bc/bc/checkpoints/
 bc/replays/
