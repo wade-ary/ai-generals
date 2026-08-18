@@ -1,0 +1,32 @@
+Important decisions
+===================
+
+- BC trains the policy with cross-entropy on the recorded action.
+- BC trains the categorical value head with PPO's HL-Gauss cross-entropy,
+  using the replay reward directly without discounting.
+- BC total loss is action_loss + value_beta * value_loss.
+- Keep the optimizer update, EMA update, and metric accumulation in one compiled
+  training operation.
+- Measure GPU waiting with a background NVML sampler rather than inserting JAX
+  synchronization. Per shard, log mean/minimum GPU utilization and the fraction
+  of samples at or below 5% utilization. The first shard includes compilation.
+- Represent each mmap-friendly minibatch as a contiguous block start plus its
+  shuffle permutation. Do not sort indices during batch preparation.
+- Use the 2025 BC cosine learning-rate schedule over global optimizer steps:
+  lr_max=2e-4 and T=100,000. Clamp the learning rate to zero after step T.
+- Use AdamW with beta1=0.9, beta2=0.9999, weight_decay=0.01, and Straka's
+  global gradient clipping threshold of L2 norm 2.0. Apply weight decay only to learned arrays
+  with rank greater than one (linear matrices and learned token/position
+  embeddings). Do not decay biases, LayerNorm parameters, or one-dimensional
+  fixed state such as the HL-Gauss value-bin centers.
+- Use two host batch buffers and two device batch buffers in a ping-pong
+  pipeline. Before training starts, prepare batches 1 and 2 on the host and
+  transfer batch 1. While batch N trains, transfer N+1 and prepare N+2.
+- Decompress synchronously only for the first shard of the training run. While
+  the final shard of each epoch trains, prefetch the first shuffled shard of the
+  next epoch into the free staging slot.
+- Aggregate pipeline telemetry once per shard. Keep average batch train,
+  disk-to-CPU, CPU-to-GPU, and exposed data-stall times, plus shard decompression,
+  exposed shard wait, mean GPU utilization, and GPU idle fraction.
+- Support checkpoint-free benchmark runs and report total minibatches, trained
+  samples, wall time, and throughput at the end of every epoch.

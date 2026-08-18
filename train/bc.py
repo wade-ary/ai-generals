@@ -6,14 +6,15 @@ observations are 24x24, so only the spatial input/action dimensions differ
 from the original 12x12 S checkpoints.
 
 The remaining training pipeline is layered on top of the initialization in
-this file: four-shard in-memory streaming, one-pass shard updates, EMA, epoch
-evaluation, and checkpointing.
+this file: four-shard in-memory streaming, one-pass shard updates, EMA, and
+checkpointing.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -43,6 +44,7 @@ BC_HL_SIGMA = 0.04
 BC_TRAIN_FIELDS = ("obs", "action_mask", "temporal", "action", "reward")
 BC_SHARD_WORKERS = 2
 BC_RAM_SLOTS = 4
+BC_CHECKPOINT_STEPS = (15_000, 30_000, 45_000, 60_000, 75_000, 90_000, 100_000)
 
 
 @dataclass(frozen=True)
@@ -58,25 +60,20 @@ class BCTrainConfig:
         "/content/drive/MyDrive/generals_bc/metrics.jsonl"
     )
 
-    s500_checkpoint: Path = Path("S/S_500/S_500.eqx")
-    s500_config: Path = Path("S/S_500/config.yaml")
-    s750_checkpoint: Path = Path("S/S_750/S_750.eqx")
-    s750_config: Path = Path("S/S_750/config.yaml")
-
     seed: int = 44
     max_epochs: int = 50
-    minibatch_size: int = 2_048
+    minibatch_size: int = 1_024
     value_beta: float = 0.25
     ema_decay: float = 0.999
-    checkpoint_every: int = 5
+    max_grad_norm: float = 2.0
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.9999
+    weight_decay: float = 0.01
+    checkpoint_steps: tuple[int, ...] = BC_CHECKPOINT_STEPS
     skip_checkpoints: bool = False
 
     initial_lr: float = 2e-4
     lr_cosine_steps: int = 100_000
-
-    eval_games_per_opponent: int = 50
-    eval_seed: int = 12_345
-    skip_eval: bool = False
 
     @property
     def run_config_path(self) -> Path:
@@ -106,7 +103,7 @@ def make_bc_model_config(path: str | Path) -> Config:
         max_grid_size=23,
         init_checkpoint="",
         ema_checkpoint="",
-        minibatch_size=2_048,
+        minibatch_size=1_024,
         use_bf16=True,
         value_loss="ce",
         num_bins=BC_VALUE_BINS,
@@ -116,14 +113,26 @@ def make_bc_model_config(path: str | Path) -> Config:
     )
 
 
-def make_optimizer(max_grad_norm: float) -> optax.GradientTransformation:
-    """Adam with PPO's global gradient clipping and externally supplied LR."""
+def _weight_decay_mask(params: Any) -> Any:
+    """Decay learned matrices/embeddings, excluding all one-dimensional state."""
 
-    # Learning rate is applied to updates inside the eventual train step. This
-    # keeps Adam state intact when the epoch-level plateau schedule changes LR.
+    return jax.tree.map(
+        lambda value: eqx.is_array(value) and value.ndim > 1,
+        params,
+    )
+
+
+def make_optimizer(cfg: BCTrainConfig) -> optax.GradientTransformation:
+    """AdamW with global gradient clipping and masked weight decay."""
+
+    # Learning rate is applied to updates inside the train step so the cosine
+    # schedule can be driven by the exact global optimizer step.
+    # Decay matrix/embedding weights, but not biases, normalization parameters,
+    # or fixed one-dimensional arrays such as the HL-Gauss value-bin centers.
     return optax.chain(
-        optax.clip_by_global_norm(max_grad_norm),
-        optax.scale_by_adam(),
+        optax.clip_by_global_norm(cfg.max_grad_norm),
+        optax.scale_by_adam(b1=cfg.adam_beta1, b2=cfg.adam_beta2),
+        optax.add_decayed_weights(cfg.weight_decay, mask=_weight_decay_mask),
     )
 
 
@@ -453,15 +462,24 @@ def initialize_training(
         raise ValueError("max_epochs must be positive")
     if cfg.value_beta < 0:
         raise ValueError("value_beta must be non-negative")
+    if cfg.max_grad_norm <= 0:
+        raise ValueError("max_grad_norm must be positive")
+    if not 0.0 <= cfg.adam_beta1 < 1.0:
+        raise ValueError("adam_beta1 must be in [0, 1)")
+    if not 0.0 <= cfg.adam_beta2 < 1.0:
+        raise ValueError("adam_beta2 must be in [0, 1)")
+    if cfg.weight_decay < 0:
+        raise ValueError("weight_decay must be non-negative")
     if cfg.initial_lr <= 0:
         raise ValueError("initial_lr must be positive")
     if cfg.lr_cosine_steps <= 0:
         raise ValueError("lr_cosine_steps must be positive")
-    if cfg.eval_games_per_opponent <= 0 or cfg.eval_games_per_opponent % 2:
-        raise ValueError("eval_games_per_opponent must be positive and even")
-
     model_cfg = make_bc_model_config(cfg.model_config)
-    model_cfg = replace(model_cfg, minibatch_size=cfg.minibatch_size)
+    model_cfg = replace(
+        model_cfg,
+        minibatch_size=cfg.minibatch_size,
+        max_grad_norm=cfg.max_grad_norm,
+    )
     bundle = get_network_bundle(model_cfg.network)
 
     key = jrandom.PRNGKey(cfg.seed)
@@ -480,7 +498,7 @@ def initialize_training(
             f"{BC_VALUE_BINS}-bin head"
         )
 
-    optimizer = make_optimizer(model_cfg.max_grad_norm)
+    optimizer = make_optimizer(cfg)
     trainable = eqx.filter(network, eqx.is_array)
     opt_state = optimizer.init(trainable)
     ema_network = jax.tree.map(
@@ -534,17 +552,26 @@ def _append_metrics(path: Path, payload: Mapping[str, Any]) -> None:
 
 def _save_checkpoints(
     cfg: BCTrainConfig,
-    epoch: int,
+    optimizer_step: int,
     network: Any,
     opt_state: optax.OptState,
     ema_network: Any,
 ) -> None:
-    model_path = cfg.checkpoint_dir / f"BC_S_24_epoch_{epoch:04d}.eqx"
-    ema_path = cfg.checkpoint_dir / f"BC_S_24_ema_epoch_{epoch:04d}.eqx"
+    model_path = cfg.checkpoint_dir / f"BC_S_24_step_{optimizer_step:06d}.eqx"
+    ema_path = cfg.checkpoint_dir / f"BC_S_24_ema_step_{optimizer_step:06d}.eqx"
+    model_config_path = model_path.with_suffix(".yaml")
+    ema_config_path = ema_path.with_suffix(".yaml")
+    run_config_path = cfg.checkpoint_dir / (
+        f"BC_S_24_step_{optimizer_step:06d}_run_config.json"
+    )
     eqx.tree_serialise_leaves(model_path, (network, opt_state))
     eqx.tree_serialise_leaves(ema_path, ema_network)
     eqx.tree_serialise_leaves(cfg.checkpoint_dir / "BC_S_24_ema.eqx", ema_network)
+    shutil.copyfile(cfg.checkpoint_dir / "config.yaml", model_config_path)
+    shutil.copyfile(cfg.checkpoint_dir / "config.yaml", ema_config_path)
+    shutil.copyfile(cfg.run_config_path, run_config_path)
     print(f"Saved checkpoint: {model_path}")
+    print(f"Saved EMA checkpoint: {ema_path}")
 
 
 def _train_loaded_shard(
@@ -568,6 +595,8 @@ def _train_loaded_shard(
     batch_specs = _shuffled_batch_specs(
         shard.sample_count, cfg.minibatch_size, rng
     )
+    max_steps = max(cfg.checkpoint_steps)
+    batch_specs = batch_specs[: max(0, max_steps - optimizer_step)]
     dropped = shard.sample_count - len(batch_specs) * cfg.minibatch_size
     if not batch_specs:
         raise ValueError(
@@ -672,6 +701,13 @@ def _train_loaded_shard(
             # finish before that batch can train.
             training_ready_at = training_ready.result()
             batch_training_seconds += training_ready_at - training_started
+            if (
+                not cfg.skip_checkpoints
+                and optimizer_step in cfg.checkpoint_steps
+            ):
+                _save_checkpoints(
+                    cfg, optimizer_step, network, opt_state, ema_network
+                )
             if transfer_ready is not None:
                 transfer_ready_at = transfer_ready.result()
                 device_transfer_seconds += (
@@ -826,6 +862,8 @@ def train_bc(
     epoch_batches = 0
     epoch_trained_samples = 0
     run_started = time.perf_counter()
+    max_steps = max(cfg.checkpoint_steps)
+    training_complete = False
 
     def submit_pair(
         pool: ThreadPoolExecutor, pair: list[ShardPlan]
@@ -899,7 +937,10 @@ def train_bc(
                 # wait until both following shards are resident before rotating.
                 current_pair[pair_offset] = None
                 del current
-                if pair_offset + 1 == len(pair_plans) and next_futures:
+                if optimizer_step >= max_steps:
+                    training_complete = True
+                    metrics["shard_exposed_wait_seconds"] = 0.0
+                elif pair_offset + 1 == len(pair_plans) and next_futures:
                     wait_started = time.perf_counter()
                     next_pair = [future.result() for future in next_futures]
                     metrics["shard_exposed_wait_seconds"] = (
@@ -934,18 +975,19 @@ def train_bc(
                         f"time={epoch_seconds / 60.0:.1f}m "
                         f"@ {epoch_metrics['samples_per_second']:.0f} samples/s"
                     )
-                    if (
-                        not cfg.skip_checkpoints
-                        and (
-                            plan.epoch % cfg.checkpoint_every == 0
-                            or plan.epoch == cfg.max_epochs
-                        )
-                    ):
-                        _save_checkpoints(
-                            cfg, plan.epoch, network, opt_state, ema_network
-                        )
+                if training_complete:
+                    break
 
+            if training_complete:
+                break
             current_pair = list(next_pair)
+
+    if optimizer_step < max_steps:
+        raise RuntimeError(
+            f"Training data ended at step {optimizer_step:,} before the "
+            f"configured final step {max_steps:,}"
+        )
+    print(f"Training complete at optimizer step {optimizer_step:,}")
 
     return network, opt_state, ema_network
 
@@ -970,10 +1012,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=44)
     parser.add_argument("--max-epochs", type=int, default=50)
-    parser.add_argument("--minibatch-size", type=int, default=2_048)
+    parser.add_argument("--minibatch-size", type=int, default=1_024)
     parser.add_argument("--initial-lr", type=float, default=2e-4)
     parser.add_argument("--lr-cosine-steps", type=int, default=100_000)
-    parser.add_argument("--skip-eval", action="store_true")
     parser.add_argument("--skip-checkpoints", action="store_true")
     parser.add_argument(
         "--initialize-only",
@@ -997,7 +1038,6 @@ def main() -> None:
         minibatch_size=args.minibatch_size,
         initial_lr=args.initial_lr,
         lr_cosine_steps=args.lr_cosine_steps,
-        skip_eval=args.skip_eval,
         skip_checkpoints=args.skip_checkpoints,
     )
 
@@ -1025,13 +1065,21 @@ def main() -> None:
     )
     print(
         f"minibatch={cfg.minibatch_size:,} bf16={model_cfg.use_bf16} "
-        f"grad_clip={model_cfg.max_grad_norm} ema={cfg.ema_decay} "
+        f"grad_clip={cfg.max_grad_norm} ema={cfg.ema_decay} "
         f"host_buffers=2 device_buffers=2 shard_workers={BC_SHARD_WORKERS} "
         f"ram_shard_slots={BC_RAM_SLOTS}"
     )
     print(
+        f"optimizer=AdamW beta1={cfg.adam_beta1} beta2={cfg.adam_beta2} "
+        f"weight_decay={cfg.weight_decay}"
+    )
+    print(
         f"learning_rate=cosine max={cfg.initial_lr:.1e} "
         f"steps={cfg.lr_cosine_steps:,}"
+    )
+    print(
+        "checkpoint steps="
+        + ", ".join(f"{step:,}" for step in cfg.checkpoint_steps)
     )
     print(f"parameters={_parameter_count(network):,}")
     print(f"checkpoint config: {cfg.run_config_path}")
