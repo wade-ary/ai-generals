@@ -791,15 +791,6 @@ def _print_shard_metrics(metrics: Mapping[str, Any]) -> None:
         f"resident={_format_bytes(metrics['shard_resident_bytes'])} "
         f"exposed={metrics['shard_exposed_wait_seconds']:.2f}s"
     )
-    warnings = []
-    if metrics["shard_exposed_wait_seconds"] > 0.05:
-        warnings.append("next in-memory shard pair was not ready after training")
-    if metrics["batch_data_exposed_ms"] > 1.0:
-        warnings.append("next-batch data was not fully ready when training ended")
-    if metrics.get("gpu_idle_sample_fraction", 0.0) > 0.05:
-        warnings.append("GPU was near-idle in more than 5% of telemetry samples")
-    if warnings:
-        print("  PIPELINE WARNING: " + "; ".join(warnings))
 
 
 def train_bc(
