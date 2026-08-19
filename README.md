@@ -4,4 +4,7 @@ A transformer-based reinforcement-learning agent for [Generals.io](https://gener
 Extension to: https://github.com/wade-ary/generals-ai
 Work in progress, but here are some test agents playing each other:
 
-![S_2250 versus S_1750 evaluation replay at 3x speed](generals/assets/gifs/s2250-vs-s1750.gif)
+
+
+![BC 75k versus BC EMA 100k on a 24x24 map](BC_75k_vs_EMA_100k_24x24.gif)
+
