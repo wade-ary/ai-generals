@@ -40,6 +40,8 @@ per GPU. At completion, the trainer saves
 
 Curriculum is disabled. Every iteration uses the top-level 12x12 environment
 settings: general distance 4-8, 9-11 cities, and castle values 13-18.
+PPO retains the top 25% of samples by absolute advantage and caps the learning
+rate at `3e-5` to protect the transferred BC policy during early adaptation.
 
 Run training and the end-of-run evaluation from the repository root:
 

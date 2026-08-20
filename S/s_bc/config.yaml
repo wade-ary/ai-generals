@@ -29,14 +29,14 @@ max_army_ratio: 2.0
 max_land_ratio: 2.0
 max_castle_ratio: 2.0
 num_epochs: 1
-lr: 0.0001
+lr: 3e-05
 final_lr: 0.0
 lr_decay_iters: 0
 lr_schedule: power_law
 lr_power_law_numerator: 0.5
 lr_power_law_exponent: 1.1
 lr_power_law_min: 5e-06
-lr_power_law_max: 0.0001
+lr_power_law_max: 3e-05
 max_grad_norm: 2.0
 gamma: 1.0
 gamma_end: 1.0
@@ -52,7 +52,7 @@ ent_schedule: power_law
 ent_power: 0.2
 ent_coef_min: 0.001
 target_kl: 0.02
-adv_top_frac: 0.5
+adv_top_frac: 0.25
 value_loss: ce
 num_bins: 128
 v_min: -1.0
