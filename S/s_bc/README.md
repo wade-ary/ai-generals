@@ -34,7 +34,7 @@ Conversion command:
   --output-config S/s_bc/config.yaml
 ```
 
-The run is configured for exactly 500 PPO iterations with 2,048 environments
+The run is configured for exactly 200 PPO iterations with 2,048 environments
 per GPU. At completion, the trainer saves
 `checkpoints/S_BC_12/S_BC_12_final.eqx`.
 
@@ -42,11 +42,13 @@ Curriculum is disabled. Every iteration uses the top-level 12x12 environment
 settings: general distance 4-8, 9-11 cities, and castle values 13-18.
 PPO retains the top 25% of samples by absolute advantage and caps the learning
 rate at `3e-5` to protect the transferred BC policy during early adaptation.
+Random-agent evaluation is disabled; the only evaluation is the 200-game
+paired comparison against the base `S_500` model after training completes.
 
 Run training and the end-of-run evaluation from the repository root:
 
 ```bash
-S/s_bc/run_500_selfplay_and_eval.sh
+S/s_bc/run_200_selfplay_and_eval.sh
 ```
 
 After training, the script compares the final model against the 12x12 base
@@ -59,5 +61,5 @@ seat assignments). It saves both the recorded matchup and a GIF:
 Set `PYTHON_BIN` if the Python executable is elsewhere, for example:
 
 ```bash
-PYTHON_BIN=python S/s_bc/run_500_selfplay_and_eval.sh
+PYTHON_BIN=python S/s_bc/run_200_selfplay_and_eval.sh
 ```

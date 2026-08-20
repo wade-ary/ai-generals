@@ -139,7 +139,7 @@ def periodic_eval(it, cfg, eval_freq, network, ema_params, static,
     vs-random eval runs (it drives curriculum advancement).
     """
     eval_ran = False
-    if it % eval_freq == 0:
+    if eval_freq > 0 and it % eval_freq == 0:
         key, eval_key = jrandom.split(key)
         n_maps = cfg.eval_games // 2
         if ev.eval_opponent_agent is not None:

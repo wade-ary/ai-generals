@@ -725,11 +725,13 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         del vals, next_vals, rews, terminated, truncated, winners, owned_cities
         del dones, dones_p0, terminated_p0, winners_p0
 
-    # Evaluate once more after the final PPO update (e.g. global iteration 750).
-    final_it = iter_offset + cfg.num_iters
-    network = _get_network()
-    _, _, key = periodic_eval(
-        final_it, cfg, 1, network, ema_params, static,
-        eval_env, eval_pool, ev, logger, key, last_eval_wr)
+    # Evaluate once more after the final PPO update unless periodic evaluation
+    # is explicitly disabled with eval_every <= 0.
+    if cfg.eval_every > 0:
+        final_it = iter_offset + cfg.num_iters
+        network = _get_network()
+        _, _, key = periodic_eval(
+            final_it, cfg, 1, network, ema_params, static,
+            eval_env, eval_pool, ev, logger, key, last_eval_wr)
 
     return network, _get_opt_state()

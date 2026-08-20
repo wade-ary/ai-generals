@@ -20,7 +20,7 @@ conv_dim: 256
 use_bf16: true
 num_envs: 2048
 num_steps: 256
-num_iters: 500
+num_iters: 200
 minibatch_size: 1024
 seed: 44
 reward_fn: relative_progress_reward
@@ -58,7 +58,7 @@ num_bins: 128
 v_min: -1.0
 v_max: 1.0
 hl_sigma: 0.04
-eval_every: 50
+eval_every: 0
 eval_every_after: 0
 eval_games: 512
 eval_ema_only: false
