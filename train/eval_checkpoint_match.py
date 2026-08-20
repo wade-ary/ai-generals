@@ -361,7 +361,12 @@ def main():
     print(f"Winner: {winner_name} | Steps: {len(states) - 1}")
     print(f"Saved: {os.path.abspath(args.replay_output)}")
 
-    if args.show_replay:
+    if args.gif_output:
+        save_replay_gif(
+            states, infos, [agent_a.name, agent_b.name], args.gif_output, args.fps,
+            max(1, args.gif_stride), max(0.1, args.gif_speed),
+        )
+    elif args.show_replay:
         show_replay(states, infos, [agent_a.name, agent_b.name], args.fps)
     else:
         print("Run again with --show-replay on a machine with a display to watch it.")
