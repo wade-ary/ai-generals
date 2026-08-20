@@ -14,13 +14,23 @@ bc_batch_*
 
 # Model weights / serialized data
 S/
+checkpoints/
+models/
+weights/
+s_bc_200/
 *.eqx
 *.pt
 *.pth
+*.safetensors
+*.onnx
+*.pb
+*.tflite
 *.npz
 *.pkl
 *.ckpt
 *.h5
+*.hdf5
+*.joblib
 game_winners.json
 
 # OS metadata
