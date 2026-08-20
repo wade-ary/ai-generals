@@ -85,20 +85,6 @@ reset_pool_every: 10
 save_every: 500
 debug: false
 curriculum:
-- min_generals_distance: 2
-  max_generals_distance: 6
-  num_cities_min: 2
-  num_cities_max: 4
-- win_rate_threshold: 0.6
-  min_generals_distance: 6
-  max_generals_distance: 10
-  num_cities_min: 2
-  num_cities_max: 4
-- win_rate_threshold: 0.6
-  min_generals_distance: 11
-  max_generals_distance: 17
-  num_cities_min: 2
-  num_cities_max: 4
 castle_val_min: 13
 castle_val_max: 18
 num_cities_min: 9

@@ -38,6 +38,9 @@ The run is configured for exactly 500 PPO iterations with 2,048 environments
 per GPU. At completion, the trainer saves
 `checkpoints/S_BC_12/S_BC_12_final.eqx`.
 
+Curriculum is disabled. Every iteration uses the top-level 12x12 environment
+settings: general distance 4-8, 9-11 cities, and castle values 13-18.
+
 Run training and the end-of-run evaluation from the repository root:
 
 ```bash
