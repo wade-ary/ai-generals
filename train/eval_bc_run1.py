@@ -1,9 +1,7 @@
-"""Run the complete BC run-1 checkpoint tournament in Colab.
+"""Run the BC run-1 checkpoint tournament on 24x24 maps in Colab.
 
 The script discovers every milestone model and EMA model in checkpoints_run1,
-runs a combined round robin on both 12x12 and 24x24 maps, then plays the 12x12
-tournament winner against S_2250. Results are printed and saved as JSON/CSV,
-and one winner-vs-S_2250 game is rendered as a GIF.
+runs one combined 24x24 round robin, and prints/saves JSON and CSV results.
 """
 
 from __future__ import annotations
@@ -11,30 +9,24 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
 from typing import Any
 
-# Colab renders pygame into an off-screen surface.
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
-import numpy as np
 from ruamel.yaml import YAML
 
 from config import Config
 from evals.agent import Agent
 from generals.core.action import compute_valid_move_mask
 from generals.core.env import GeneralsEnv
-from generals.core.game import get_info, get_observation
+from generals.core.game import get_observation
 from networks import build_network, get_network_bundle, obs_to_array, reset_done_envs
 from train.bc import BCTrainConfig, make_optimizer
-from train.eval_checkpoint_match import save_replay_gif
 
 
 @dataclass(frozen=True)
@@ -346,172 +338,6 @@ def _save_tournament(
         writer.writerows(standings)
 
 
-def play_match_mixed_padding(
-    agent_a: Agent,
-    agent_b: Agent,
-    env: GeneralsEnv,
-    pool: Any,
-    num_games: int,
-    key: jax.Array,
-) -> tuple[int, int, int]:
-    """Vectorized match for agents whose networks use different pad sizes."""
-
-    state_a = agent_a.init_obs_state_fn(agent_a.pad_to, agent_a.pad_to)
-    state_b = agent_b.init_obs_state_fn(agent_b.pad_to, agent_b.pad_to)
-    batched_a = jax.tree.map(lambda x: jnp.repeat(x[None], num_games, 0), state_a)
-    batched_b = jax.tree.map(lambda x: jnp.repeat(x[None], num_games, 0), state_b)
-
-    @jax.jit
-    def _play(net_a, net_b, match_key):
-        match_key, *init_keys = jrandom.split(match_key, num_games + 1)
-        states = jax.vmap(env.init_state)(jnp.stack(init_keys))
-        finished = jnp.zeros(num_games, dtype=jnp.bool_)
-        wins_a = jnp.int32(0)
-        wins_b = jnp.int32(0)
-        draws = jnp.int32(0)
-
-        def body(carry, _):
-            states, finished, wins_a, wins_b, draws, obs_a, obs_b = carry
-            raw_a = jax.vmap(lambda s: get_observation(s, 0))(states)
-            raw_b = jax.vmap(lambda s: get_observation(s, 1))(states)
-            aug_a, obs_a = jax.vmap(agent_a.augment_fn)(
-                jax.vmap(obs_to_array)(raw_a), obs_a
-            )
-            aug_b, obs_b = jax.vmap(agent_b.augment_fn)(
-                jax.vmap(obs_to_array)(raw_b), obs_b
-            )
-            mask_a = jax.vmap(
-                lambda o: compute_valid_move_mask(o.armies, o.owned_cells, o.mountains)
-            )(raw_a)
-            mask_b = jax.vmap(
-                lambda o: compute_valid_move_mask(o.armies, o.owned_cells, o.mountains)
-            )(raw_b)
-            temporal_a = jnp.stack(
-                [obs_a.opponent_army_history, obs_a.opponent_land_history], axis=1
-            )
-            temporal_b = jnp.stack(
-                [obs_b.opponent_army_history, obs_b.opponent_land_history], axis=1
-            )
-            actions_a = jax.vmap(agent_a.greedy_fn, in_axes=(None, 0, 0, 0))(
-                net_a, aug_a, mask_a, temporal_a
-            )
-            actions_b = jax.vmap(agent_b.greedy_fn, in_axes=(None, 0, 0, 0))(
-                net_b, aug_b, mask_b, temporal_b
-            )
-            timesteps, new_states = jax.vmap(lambda s, a: env.step(s, a, pool))(
-                states, jnp.stack([actions_a, actions_b], axis=1)
-            )
-            dones = timesteps.terminated | timesteps.truncated
-            newly_done = dones & ~finished
-            wins_a += jnp.sum(newly_done & (timesteps.info.winner == 0))
-            wins_b += jnp.sum(newly_done & (timesteps.info.winner == 1))
-            draws += jnp.sum(newly_done & timesteps.truncated & ~timesteps.terminated)
-            return (
-                new_states,
-                finished | dones,
-                wins_a,
-                wins_b,
-                draws,
-                reset_done_envs(obs_a, dones),
-                reset_done_envs(obs_b, dones),
-            ), None
-
-        (_, _, wins_a, wins_b, draws, _, _), _ = jax.lax.scan(
-            body,
-            (states, finished, wins_a, wins_b, draws, batched_a, batched_b),
-            None,
-            length=env.truncation,
-        )
-        return wins_a, wins_b, draws
-
-    wins_a, wins_b, draws = _play(agent_a.network, agent_b.network, key)
-    return int(wins_a), int(wins_b), int(draws)
-
-
-def evaluate_mixed_paired(
-    agent_a: Agent,
-    agent_b: Agent,
-    env: GeneralsEnv,
-    pool: Any,
-    games: int,
-    seed: int,
-) -> PairResult:
-    if games <= 0 or games % 2:
-        raise ValueError("S_2250 games must be a positive even number")
-    maps = games // 2
-    key = jrandom.PRNGKey(seed)
-    a_p0, b_p1, draws_ab = play_match_mixed_padding(
-        agent_a, agent_b, env, pool, maps, key
-    )
-    b_p0, a_p1, draws_ba = play_match_mixed_padding(
-        agent_b, agent_a, env, pool, maps, key
-    )
-    a_wins = a_p0 + a_p1
-    b_wins = b_p1 + b_p0
-    draws = draws_ab + draws_ba
-    return PairResult(
-        agent_a.name,
-        agent_b.name,
-        games,
-        a_wins,
-        b_wins,
-        draws,
-        (a_wins + 0.5 * draws) / games,
-    )
-
-
-def record_mixed_game(
-    agent_p0: Agent,
-    agent_p1: Agent,
-    env: GeneralsEnv,
-    pool: Any,
-    seed: int,
-):
-    state = env.init_state(jrandom.PRNGKey(seed))
-    obs_p0_state = agent_p0.init_obs_state_fn(agent_p0.pad_to, agent_p0.pad_to)
-    obs_p1_state = agent_p1.init_obs_state_fn(agent_p1.pad_to, agent_p1.pad_to)
-    states = [state]
-    infos = [get_info(state)]
-    winner = -1
-    for _ in range(env.truncation):
-        raw_p0 = get_observation(state, 0)
-        raw_p1 = get_observation(state, 1)
-        aug_p0, obs_p0_state = agent_p0.augment_fn(
-            obs_to_array(raw_p0), obs_p0_state
-        )
-        aug_p1, obs_p1_state = agent_p1.augment_fn(
-            obs_to_array(raw_p1), obs_p1_state
-        )
-        mask_p0 = compute_valid_move_mask(
-            raw_p0.armies, raw_p0.owned_cells, raw_p0.mountains
-        )
-        mask_p1 = compute_valid_move_mask(
-            raw_p1.armies, raw_p1.owned_cells, raw_p1.mountains
-        )
-        temporal_p0 = jnp.stack(
-            [obs_p0_state.opponent_army_history, obs_p0_state.opponent_land_history]
-        )
-        temporal_p1 = jnp.stack(
-            [obs_p1_state.opponent_army_history, obs_p1_state.opponent_land_history]
-        )
-        action_p0 = agent_p0.greedy_fn(
-            agent_p0.network, aug_p0, mask_p0, temporal_p0
-        )
-        action_p1 = agent_p1.greedy_fn(
-            agent_p1.network, aug_p1, mask_p1, temporal_p1
-        )
-        timestep, new_state = env.step(
-            state, jnp.stack([action_p0, action_p1]), pool
-        )
-        states.append(timestep.last_state)
-        infos.append(timestep.info)
-        if bool(timestep.terminated) or bool(timestep.truncated):
-            winner = int(timestep.info.winner)
-            break
-        state = new_state
-    return states, infos, winner
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -525,17 +351,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("/content/drive/MyDrive/generals_bc/eval_run1"),
     )
     parser.add_argument("--games-per-pair", type=int, default=20)
-    parser.add_argument("--s-games", type=int, default=100)
     parser.add_argument("--seed", type=int, default=12_345)
-    parser.add_argument(
-        "--s2250-checkpoint", type=Path, default=Path("S/sss/S_2250.eqx")
-    )
-    parser.add_argument(
-        "--s2250-config", type=Path, default=Path("S/sss/config (3).yaml")
-    )
-    parser.add_argument("--gif-stride", type=int, default=4)
-    parser.add_argument("--gif-fps", type=int, default=10)
-    parser.add_argument("--gif-speed", type=float, default=2.0)
     return parser.parse_args()
 
 
@@ -543,92 +359,35 @@ def main() -> None:
     args = parse_args()
     if args.games_per_pair <= 0 or args.games_per_pair % 2:
         raise ValueError("--games-per-pair must be a positive even number")
-    if args.s_games <= 0 or args.s_games % 2:
-        raise ValueError("--s-games must be a positive even number")
 
     agents = discover_bc_agents(args.checkpoint_dir)
-    agent_by_name = {agent.name: agent for agent in agents}
-    s2250 = Agent.load(args.s2250_checkpoint, args.s2250_config)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    winners: dict[int, Agent] = {}
-    for grid_size in (12, 24):
-        # Use S_2250's map distribution at 12x12 and BC's at 24x24.
-        env_cfg = s2250.config if grid_size == 12 else agents[0].config
-        maps = args.games_per_pair // 2
-        env = make_eval_env(env_cfg, grid_size, maps)
-        pool, _ = env.reset(jrandom.PRNGKey(args.seed + grid_size * 1_000))
-        print(
-            f"\n##### {grid_size}x{grid_size} combined checkpoint/EMA tournament "
-            f"({args.games_per_pair} paired games per matchup) #####"
-        )
-        pairs, standings = run_round_robin(
-            agents,
-            env,
-            pool,
-            args.games_per_pair,
-            args.seed + grid_size * 10_000,
-        )
-        label = f"bc_run1_{grid_size}x{grid_size}"
-        _print_standings(label, standings)
-        _save_tournament(
-            args.output_dir,
-            label,
-            grid_size,
-            args.games_per_pair,
-            pairs,
-            standings,
-        )
-        winners[grid_size] = agent_by_name[standings[0]["name"]]
-
-    winner = winners[12]
-    final_env = make_eval_env(
-        s2250.config, 12, max(args.s_games // 2, 1_000)
-    )
-    final_pool, _ = final_env.reset(jrandom.PRNGKey(args.seed + 900_000))
-    final = evaluate_mixed_paired(
-        winner,
-        s2250,
-        final_env,
-        final_pool,
-        args.s_games,
-        args.seed + 910_000,
-    )
-    print("\n=== 12x12 tournament winner vs S_2250 ===")
-    print(f"Winner checkpoint: {winner.name}")
+    grid_size = 24
+    maps = args.games_per_pair // 2
+    env = make_eval_env(agents[0].config, grid_size, maps)
+    pool, _ = env.reset(jrandom.PRNGKey(args.seed + grid_size * 1_000))
     print(
-        f"{winner.name}: {final.a_wins} wins | S_2250: {final.b_wins} wins | "
-        f"draws: {final.draws} | winner score: {100 * final.a_score:.2f}%"
+        "\n##### 24x24 combined checkpoint/EMA tournament "
+        f"({args.games_per_pair} paired games per matchup) #####"
     )
-    with (args.output_dir / "winner_12x12_vs_S_2250.json").open(
-        "w", encoding="utf-8"
-    ) as handle:
-        json.dump(asdict(final), handle, indent=2)
-        handle.write("\n")
-
-    states, infos, replay_winner = record_mixed_game(
-        winner,
-        s2250,
-        final_env,
-        final_pool,
-        args.seed + 920_000,
+    pairs, standings = run_round_robin(
+        agents,
+        env,
+        pool,
+        args.games_per_pair,
+        args.seed + grid_size * 10_000,
     )
-    gif_path = args.output_dir / "winner_12x12_vs_S_2250.gif"
-    save_replay_gif(
-        states,
-        infos,
-        [winner.name, s2250.name],
-        gif_path,
-        args.gif_fps,
-        max(1, args.gif_stride),
-        max(0.1, args.gif_speed),
+    label = "bc_run1_24x24"
+    _print_standings(label, standings)
+    _save_tournament(
+        args.output_dir,
+        label,
+        grid_size,
+        args.games_per_pair,
+        pairs,
+        standings,
     )
-    replay_name = (
-        winner.name if replay_winner == 0
-        else s2250.name if replay_winner == 1
-        else "draw"
-    )
-    print(f"Recorded GIF winner: {replay_name}")
     print(f"All results saved under: {args.output_dir}")
 
 

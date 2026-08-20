@@ -7,6 +7,7 @@ data/bc_data/
 data/bc_data_with_winners/
 data/bc_small_shards/
 data/bc_test_10/
+checkpoints_run1/
 bc/bc/checkpoints/
 bc/replays/
 bc_batch_*
