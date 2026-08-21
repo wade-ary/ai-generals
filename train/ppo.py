@@ -10,10 +10,14 @@ import equinox as eqx
 
 from generals.core.env import GeneralsEnv
 from train.rewards import get_reward_fn
-from train.rollout_selfplay import collect_rollout as collect_rollout_self
+from train.rollout_selfplay import (
+    collect_rollout as collect_rollout_self,
+    collect_rollout_frozen_opponent,
+)
 from train.evaluations import periodic_eval, EvalCtx
 from evals.agent import Agent
 from evals.ref_eval import load_refs
+from evals.matchup import play_match
 
 
 # ---- GAE ----
@@ -227,6 +231,15 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
     iter_offset = getattr(cfg, 'iteration_offset', 0)
     reward_fn = get_reward_fn(cfg)
 
+    # Replacement for removed jax.device_put_replicated: add the leading
+    # pmap device axis while preserving non-array/static leaves.
+    def _replicate(tree):
+        return jax.device_put(jax.tree.map(
+            lambda x: jnp.broadcast_to(x, (num_devices, *x.shape))
+            if eqx.is_array(x) else x,
+            tree,
+        ))
+
     init_obs_state_fn = bundle["init_obs_state"]
     augment_fn = bundle["augment_obs"]
     reset_fn = bundle["reset_obs_state"]
@@ -235,8 +248,8 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
 
     # Partition network for pmap: array leaves are replicated, static captured in closures
     params, static = eqx.partition(network, eqx.is_array)
-    params = jax.device_put_replicated(params, jax.devices())
-    opt_state = jax.device_put_replicated(opt_state, jax.devices())
+    params = _replicate(params)
+    opt_state = _replicate(opt_state)
 
     # Per-device environment init
     def _init_envs(key):
@@ -250,8 +263,8 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
     # Initialize per-network observation state (batched across envs, replicated across devices)
     single_state = init_obs_state_fn(grid_size, cfg.pad_to)
     batched_obs_state = jax.tree.map(lambda x: jnp.tile(x, (num_envs, *([1] * x.ndim))), single_state)
-    obs_state_p0 = jax.device_put_replicated(batched_obs_state, jax.devices())
-    obs_state_p1 = jax.device_put_replicated(batched_obs_state, jax.devices())
+    obs_state_p0 = _replicate(batched_obs_state)
+    obs_state_p1 = _replicate(batched_obs_state)
 
     # Per-device PRNG keys
     keys = jrandom.split(key, num_devices)
@@ -259,7 +272,7 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
     # ---- pmap wrappers (closures over static args) ----
 
     # Replicate pool across devices for rollout
-    pool_rep = jax.device_put_replicated(pool, jax.devices())
+    pool_rep = _replicate(pool)
 
     def _rollout_self(params, states, key, osp0, osp1, pool_r, gamma):
         network = eqx.combine(params, static)
@@ -267,6 +280,16 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
             states, env, network, key, cfg.num_steps, osp0, osp1,
             grid_size, reward_fn, augment_fn, reset_fn, gamma, pool=pool_r)
     p_rollout_self = jax.pmap(_rollout_self)
+
+    def _rollout_pool(params, opponent_params, states, key, osp0, osp1,
+                      pool_r, gamma):
+        learner = eqx.combine(params, static)
+        opponent = eqx.combine(opponent_params, static)
+        return collect_rollout_frozen_opponent(
+            states, env, learner, opponent, key, cfg.num_steps, osp0, osp1,
+            grid_size, reward_fn, augment_fn, reset_fn, greedy_fn, gamma,
+            pool=pool_r)
+    p_rollout_pool = jax.pmap(_rollout_pool)
 
     def _compute_gae(rews, vals, next_vals, terminated, truncated, gamma):
         return compute_gae(rews, vals, next_vals, terminated, truncated, gamma, cfg.gae_lambda)
@@ -304,7 +327,8 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         return jax.tree.map(lambda x: x[0], opt_state)
 
     # Sample filtering: top-k by |advantage|
-    per_device_total = cfg.num_steps * 2 * num_envs
+    data_mult = 1 if cfg.policy_pool_enabled else 2
+    per_device_total = cfg.num_steps * data_mult * num_envs
     n_keep = int(per_device_total * cfg.adv_top_frac)
     n_keep = (n_keep // cfg.minibatch_size) * cfg.minibatch_size
 
@@ -327,6 +351,37 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         print(f"Loaded EMA weights from {cfg.ema_checkpoint}")
     else:
         ema_params = jax.tree.map(lambda x: x[0].copy(), params)  # init from device 0
+
+    # Frozen historical-policy training pool. By default all slots bootstrap
+    # from the initialized candidate; optional paths can seed distinct slots.
+    policy_pool = []
+    policy_pool_generation = 0
+    if cfg.policy_pool_enabled:
+        if cfg.policy_pool_size < 1:
+            raise ValueError("policy_pool_size must be at least 1")
+        if not 0.0 <= cfg.policy_pool_combined_threshold <= 1.0:
+            raise ValueError("policy_pool_combined_threshold must be in [0, 1]")
+        if not 0.0 <= cfg.policy_pool_individual_threshold <= 1.0:
+            raise ValueError("policy_pool_individual_threshold must be in [0, 1]")
+        paths = cfg.policy_pool_paths or []
+        config_paths = cfg.policy_pool_config_paths or []
+        if bool(paths) != bool(config_paths) or len(paths) != len(config_paths):
+            raise ValueError(
+                "policy_pool_paths and policy_pool_config_paths must have equal lengths")
+        if len(paths) > cfg.policy_pool_size:
+            raise ValueError("more policy-pool paths supplied than policy_pool_size")
+        for i, (path, config_path) in enumerate(zip(paths, config_paths)):
+            agent = Agent.load(path, config_path)
+            policy_pool.append(agent)
+            print(f"POLICY POOL slot {i}: loaded {agent.name}")
+        while len(policy_pool) < cfg.policy_pool_size:
+            slot = len(policy_pool)
+            policy_pool.append(Agent(
+                _get_network(), cfg, bundle, name=f"bootstrap_{slot}"))
+        print(
+            f"POLICY POOL enabled: {len(policy_pool)} frozen opponents; "
+            f"eval every {cfg.policy_pool_eval_every} iterations, "
+            f"{cfg.policy_pool_eval_games} games/opponent")
 
     # Separate env + pool for eval
     eval_env = GeneralsEnv(
@@ -396,7 +451,7 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         eval_opponent_agent=eval_opponent_agent,
     )
 
-    mode_str = "self-play"
+    mode_str = "frozen policy-pool" if cfg.policy_pool_enabled else "self-play"
     print(f"Training ({mode_str}, {num_devices} device(s))...")
     train_start = time.time()
     pending_eval_opponent = None
@@ -438,7 +493,7 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
                 # Regenerate pool with new params (pool generator recompiles, rollout does NOT)
                 key, pool_key = jrandom.split(key)
                 pool, _ = env.reset(pool_key)
-                pool_rep = jax.device_put_replicated(pool, jax.devices())
+                pool_rep = _replicate(pool)
                 # New eval env (new object forces JIT retrace of evaluate())
                 castle = (stage.castle_val_min, stage.castle_val_max) if stage.castle_val_min is not None else eval_env.castle_val_range
                 cities = (stage.num_cities_min, stage.num_cities_max) if stage.num_cities_min is not None else eval_env.num_cities_range
@@ -456,8 +511,8 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
                 # Re-init env states from new pool
                 key, reinit_key = jrandom.split(key)
                 states = p_init_envs(jrandom.split(reinit_key, num_devices))
-                obs_state_p0 = jax.device_put_replicated(batched_obs_state, jax.devices())
-                obs_state_p1 = jax.device_put_replicated(batched_obs_state, jax.devices())
+                obs_state_p0 = _replicate(batched_obs_state)
+                obs_state_p1 = _replicate(batched_obs_state)
                 # Update gamma if specified (traced, no recompile needed)
                 if stage.gamma is not None:
                     current_gamma = stage.gamma
@@ -489,7 +544,7 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         if cfg.reset_pool_every > 0 and it > 0 and it % cfg.reset_pool_every == 0:
             key, pool_key = jrandom.split(key)
             pool, _ = env.reset(pool_key)
-            pool_rep = jax.device_put_replicated(pool, jax.devices())
+            pool_rep = _replicate(pool)
 
         # Gamma annealing: update current_gamma (traced through rollout + GAE, no recompile)
         if gamma_anneal:
@@ -499,8 +554,22 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         # Collect rollout — pmapped across devices
         t_rollout = time.perf_counter()
         gamma_rep = jnp.full(num_devices, current_gamma)
-        states, rollout_data, keys, obs_state_p0, obs_state_p1 = p_rollout_self(
-            params, states, keys, obs_state_p0, obs_state_p1, pool_rep, gamma_rep)
+        if cfg.policy_pool_enabled:
+            # Round-robin selection gives equal training exposure without
+            # recompiling a separate graph for every pool member.
+            opponent_idx = it % len(policy_pool)
+            opponent_params, opponent_static = eqx.partition(
+                policy_pool[opponent_idx].network, eqx.is_array)
+            if jax.tree.structure(opponent_static) != jax.tree.structure(static):
+                raise ValueError("policy-pool opponent architecture differs from learner")
+            opponent_params = _replicate(opponent_params)
+            states, rollout_data, keys, obs_state_p0, obs_state_p1 = p_rollout_pool(
+                params, opponent_params, states, keys, obs_state_p0,
+                obs_state_p1, pool_rep, gamma_rep)
+        else:
+            opponent_idx = None
+            states, rollout_data, keys, obs_state_p0, obs_state_p1 = p_rollout_self(
+                params, states, keys, obs_state_p0, obs_state_p1, pool_rep, gamma_rep)
         jax.block_until_ready(states)
         t_rollout = time.perf_counter() - t_rollout
         print(
@@ -610,7 +679,7 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
         wr = wins / max(eps, 1)
         lr = losses / max(eps, 1)
         dr = draws / max(eps, 1)
-        samples_per_iter = num_devices * 2 * num_envs * cfg.num_steps
+        samples_per_iter = num_devices * data_mult * num_envs * cfg.num_steps
         sps = samples_per_iter / elapsed
 
         total_steps_p0 = float(dones_p0.size)
@@ -674,6 +743,8 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
             "train/lr": current_lr,
             "train/gamma": current_gamma,
         }
+        if opponent_idx is not None:
+            log_metrics["policy_pool/training_opponent_slot"] = opponent_idx
         if cfg.debug:
             log_metrics.update({
                 "train/max_kl": m["max_kl"],
@@ -695,6 +766,65 @@ def train(env, pool, network, optimizer, opt_state, logger, key, cfg, bundle, ck
 
         # Extract single-device network for checkpointing
         network = _get_network()
+
+        # Gate historical-pool promotion on both aggregate performance and a
+        # minimum result against every individual opponent.
+        if (cfg.policy_pool_enabled
+                and cfg.policy_pool_eval_every > 0
+                and (it + 1) % cfg.policy_pool_eval_every == 0):
+            if cfg.policy_pool_eval_games < 2 or cfg.policy_pool_eval_games % 2:
+                raise ValueError("policy_pool_eval_games must be an even number >= 2")
+            candidate = Agent(network, cfg, bundle, name=f"candidate_{global_it + 1}")
+            games_per_seat = cfg.policy_pool_eval_games // 2
+            individual_wrs = []
+            total_wins = total_games = 0
+            for slot, opponent in enumerate(policy_pool):
+                # Reuse the map key with seats reversed for a paired,
+                # lower-variance comparison on identical map batches.
+                key, match_key = jrandom.split(key)
+                cw0, ow1, d0 = play_match(
+                    candidate, opponent, eval_env, eval_pool, games_per_seat,
+                    cfg.truncation, match_key)
+                ow0, cw1, d1 = play_match(
+                    opponent, candidate, eval_env, eval_pool, games_per_seat,
+                    cfg.truncation, match_key)
+                wins = cw0 + cw1
+                games = cw0 + cw1 + ow0 + ow1 + d0 + d1
+                wr_slot = wins / max(games, 1)
+                individual_wrs.append(wr_slot)
+                total_wins += wins
+                total_games += games
+                logger.log(global_it + 1, {
+                    f"policy_pool/slot_{slot}_win_rate": wr_slot,
+                })
+                print(
+                    f"  POLICY POOL EVAL slot {slot} ({opponent.name}): "
+                    f"{wins}/{games} wins ({wr_slot:.1%})")
+            combined_wr = total_wins / max(total_games, 1)
+            passed = (
+                combined_wr >= cfg.policy_pool_combined_threshold
+                and min(individual_wrs) >= cfg.policy_pool_individual_threshold)
+            logger.log(global_it + 1, {
+                "policy_pool/combined_win_rate": combined_wr,
+                "policy_pool/min_individual_win_rate": min(individual_wrs),
+                "policy_pool/promoted": float(passed),
+            })
+            print(
+                f"  POLICY POOL GATE: combined={combined_wr:.1%} "
+                f"(need {cfg.policy_pool_combined_threshold:.0%}), "
+                f"min={min(individual_wrs):.1%} "
+                f"(need {cfg.policy_pool_individual_threshold:.0%}) -> "
+                f"{'PROMOTE' if passed else 'CONTINUE'}")
+            if passed:
+                policy_pool_generation += 1
+                promoted_name = f"{run_name}_pool_n{policy_pool_generation}_{global_it + 1}"
+                promoted_path = os.path.join(ckpt_dir, f"{promoted_name}.eqx")
+                eqx.tree_serialise_leaves(promoted_path, network)
+                promoted = Agent(network, cfg, bundle, name=promoted_name)
+                policy_pool = [promoted] + policy_pool[:cfg.policy_pool_size - 1]
+                print(
+                    "  POLICY POOL: "
+                    + " -> ".join(agent.name for agent in policy_pool))
 
         completed_it = global_it + 1
         if (it + 1) % cfg.ckpt_every == 0:

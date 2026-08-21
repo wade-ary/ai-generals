@@ -90,6 +90,18 @@ class Config:
     target_kl: float = 0.02
     adv_top_frac: float = 0.25  # fraction of samples to keep by |advantage|
 
+    # Historical-policy curriculum. When enabled, PPO trains the candidate
+    # against one frozen pool member per rollout iteration instead of live
+    # self-play. Empty paths bootstrap every slot from the initialized policy.
+    policy_pool_enabled: bool = False
+    policy_pool_size: int = 3
+    policy_pool_paths: Optional[list] = None
+    policy_pool_config_paths: Optional[list] = None
+    policy_pool_eval_every: int = 100
+    policy_pool_eval_games: int = 200  # games per opponent, balanced by seat
+    policy_pool_combined_threshold: float = 0.45
+    policy_pool_individual_threshold: float = 0.35
+
     # Value loss
     value_loss: str = "mse"    # "mse" or "ce" (HL-Gauss categorical)
     num_bins: int = 128          # number of bins for CE value head
@@ -151,7 +163,7 @@ class Config:
     def __post_init__(self):
         # Coerce types — ruamel.yaml uses ScalarFloat/ScalarInt subtypes
         for f in fields(self):
-            if f.name in ("curriculum",):
+            if f.name in ("curriculum", "policy_pool_paths", "policy_pool_config_paths"):
                 continue
             val = getattr(self, f.name)
             if val is None:

@@ -124,3 +124,79 @@ def collect_rollout(states, env, network, key, num_steps, obs_state_p0, obs_stat
     final_osp0 = jax.tree.map(lambda x: x[:n], final_osp)
     final_osp1 = jax.tree.map(lambda x: x[n:], final_osp)
     return final_states, rollout_data, final_key, final_osp0, final_osp1
+
+
+@partial(jax.jit, static_argnames=["env", "num_steps", "grid_size", "reward_fn", "augment_fn", "reset_fn", "greedy_fn"])
+def collect_rollout_frozen_opponent(
+        states, env, learner, opponent, key, num_steps, obs_state_p0,
+        obs_state_p1, grid_size, reward_fn, augment_fn, reset_fn, greedy_fn,
+        gamma, pool=None):
+    """Collect PPO data for p0 against a frozen p1 opponent.
+
+    Only learner (p0) transitions are returned. The frozen opponent acts
+    greedily, matching the historical-opponent setup used in Straka (2025).
+    """
+    n = states.armies.shape[0]
+    step_fn = (lambda s, a: env.step(s, a, pool)) if pool is not None else env.step
+
+    def scan_body(carry, _):
+        states, key, osp0, osp1, _, _ = carry
+        obs0 = jax.vmap(lambda s: get_observation(s, 0))(states)
+        obs1 = jax.vmap(lambda s: get_observation(s, 1))(states)
+
+        arr0, arr1 = jax.vmap(obs_to_array)(obs0), jax.vmap(obs_to_array)(obs1)
+        mask_fn = lambda o: compute_valid_move_mask(o.armies, o.owned_cells, o.mountains)
+        masks0, masks1 = jax.vmap(mask_fn)(obs0), jax.vmap(mask_fn)(obs1)
+        aug0, new_osp0 = jax.vmap(augment_fn)(arr0, osp0)
+        aug1, new_osp1 = jax.vmap(augment_fn)(arr1, osp1)
+        aug0, aug1 = aug0.astype(jnp.bfloat16), aug1.astype(jnp.bfloat16)
+        temporal0 = jnp.stack(
+            [new_osp0.opponent_army_history, new_osp0.opponent_land_history], axis=1)
+        temporal1 = jnp.stack(
+            [new_osp1.opponent_army_history, new_osp1.opponent_land_history], axis=1)
+
+        keys = jrandom.split(key, 2 * n + 1)
+        key = keys[0]
+        a0, vals, lps, _, _, _ = jax.vmap(
+            learner, in_axes=(0, 0, 0, 0, None))(
+                aug0, masks0, temporal0, keys[1:n + 1], None)
+        a1 = jax.vmap(greedy_fn, in_axes=(None, 0, 0, 0))(
+            opponent, aug1, masks1, temporal1)
+
+        timesteps, new_states = jax.vmap(step_fn)(
+            states, jnp.stack([a0, a1], axis=1))
+        terminated, truncated = timesteps.terminated, timesteps.truncated
+        dones, winners = terminated | truncated, timesteps.info.winner
+        next_obs0 = jax.vmap(lambda s: get_observation(s, 0))(timesteps.last_state)
+        rewards = reward_fn(
+            obs0, a0, next_obs0, winners, truncated=truncated, gamma=gamma)
+        osp0 = reset_done_envs(new_osp0, dones)
+        osp1 = reset_done_envs(new_osp1, dones)
+        owned_cities = (obs0.cities * obs0.owned_cells).sum()
+        data = (aug0, masks0, temporal0, a0, lps, vals, rewards,
+                terminated, truncated, winners, owned_cities)
+        return (new_states, key, osp0, osp1, timesteps.last_state, new_osp0), data
+
+    (final_states, final_key, final_osp0, final_osp1,
+     last_pre_reset, last_osp0), data = jax.lax.scan(
+        scan_body,
+        (states, key, obs_state_p0, obs_state_p1, states, obs_state_p0),
+        None, length=num_steps)
+
+    (obs, masks, temporal, actions, lps, vals, rews, terminated,
+     truncated, winners, owned_cities) = data
+    boot_obs = jax.vmap(lambda s: get_observation(s, 0))(last_pre_reset)
+    boot_arr = jax.vmap(obs_to_array)(boot_obs)
+    boot_masks = jax.vmap(
+        lambda o: compute_valid_move_mask(o.armies, o.owned_cells, o.mountains))(boot_obs)
+    boot_aug, boot_osp = jax.vmap(augment_fn)(boot_arr, last_osp0)
+    boot_temporal = jnp.stack(
+        [boot_osp.opponent_army_history, boot_osp.opponent_land_history], axis=1)
+    boot_keys = jrandom.split(final_key, n)
+    _, final_val, _, _, _, _ = jax.vmap(
+        learner, in_axes=(0, 0, 0, 0, None))(
+            boot_aug, boot_masks, boot_temporal, boot_keys, None)
+    next_vals = jnp.concatenate([vals[1:], final_val[None]], axis=0)
+    rollout_data = (obs, masks, temporal, actions, lps, vals, next_vals,
+                    rews, terminated, truncated, winners, owned_cities)
+    return (final_states, rollout_data, final_key, final_osp0, final_osp1)

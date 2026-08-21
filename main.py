@@ -76,7 +76,8 @@ def main():
     network = build_network(cfg, net_key)
 
     # LR schedule
-    data_mult = 2  # self-play: data from both player seats
+    # Frozen-pool training updates only from the candidate's player seat.
+    data_mult = 1 if cfg.policy_pool_enabled else 2
     steps_per_iter = cfg.num_epochs * (data_mult * cfg.num_envs * cfg.num_steps // cfg.minibatch_size)
 
     if cfg.lr_schedule == "power_law":

@@ -29,7 +29,7 @@ use_bf16: true
 
 num_envs: 2048
 num_steps: 256
-num_iters: 200
+num_iters: 1000
 minibatch_size: 1024
 seed: 44
 
@@ -40,14 +40,14 @@ max_land_ratio: 2.0
 max_castle_ratio: 2.0
 
 num_epochs: 1
-lr: 3e-05
+lr: 5e-05
 final_lr: 0.0
 lr_decay_iters: 0
-lr_schedule: power_law
+lr_schedule: linear
 lr_power_law_numerator: 0.5
 lr_power_law_exponent: 1.1
 lr_power_law_min: 5e-06
-lr_power_law_max: 3e-05
+lr_power_law_max: 5e-05
 max_grad_norm: 2.0
 gamma: 1.0
 gamma_end: 1.0
@@ -64,6 +64,17 @@ ent_power: 0.2
 ent_coef_min: 0.001
 target_kl: 0.02
 adv_top_frac: 0.25
+
+# Straka-2025-style historical-policy curriculum. The three slots bootstrap
+# from the BC-initialized candidate, then become n-1/n-2/n-3 through promotion.
+policy_pool_enabled: true
+policy_pool_size: 3
+policy_pool_paths: []
+policy_pool_config_paths: []
+policy_pool_eval_every: 200
+policy_pool_eval_games: 200
+policy_pool_combined_threshold: 0.45
+policy_pool_individual_threshold: 0.35
 
 value_loss: ce
 num_bins: 128
